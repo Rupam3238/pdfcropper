@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.venv/
+venv/
+env/
+.env
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+coverage.xml
+.htmlcov/
+.pyre/
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Qt / C++
+*.o
+*.obj
+*.so
+*.a
+*.dll
+*.dylib
+*.exe
+*.out
+*.app/
+*.pro.user
+*.qmlproject.user
+CMakeFiles/
+cmake-build-*/
+Makefile
+CMakeCache.txt
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Project data
+*.log
+*.tmp
+*.bak
+
+# Local generated files
+output/
+exports/
+cache/
+
+# OCR / PDF processing cache
+ocr_cache/
+
