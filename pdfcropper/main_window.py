@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import fitz
+try:
+    import pymupdf as fitz
+except ImportError:  # pragma: no cover
+    import fitz
 from PyQt6.QtCore import QPointF, QRectF, Qt
 from PyQt6.QtGui import QAction, QKeySequence, QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
@@ -75,20 +78,21 @@ class QuestionRectItem(QGraphicsRectItem):
         self.setFlag(self.GraphicsItemFlag.ItemIsMovable, True)
         self.setZValue(10)
         self.label_item = QGraphicsSimpleTextItem(self)
-        self.label_item.setText(region.label)
+        self.label_item.setText(str(region.label))
         self.label_item.setBrush(QColor("#ffffff"))
         self.label_item.setPos(8, 8)
         self.handle_items = {}
         for name in ["top-left", "top", "top-right", "right", "bottom-right", "bottom", "bottom-left", "left"]:
             handle = ResizeHandle(self, name)
+            handle.setParentItem(self)
+            handle.setVisible(False)
             self.handle_items[name] = handle
-            self.scene().addItem(handle)
         self.sync_handles()
 
     def update_region_from_rect(self):
         rect = self.rect().getRect()
         self.region.rect = fitz.Rect(rect[0], rect[1], rect[2], rect[3])
-        self.label_item.setText(self.region.label)
+        self.label_item.setText(str(self.region.label))
 
     def sync_handles(self):
         for name, item in self.handle_items.items():
@@ -334,8 +338,9 @@ class PdfCropperMainWindow(QMainWindow):
     def add_region_from_rect(self, page_index: int, rect):
         if rect.width <= 0 or rect.height <= 0:
             return
-        region = QuestionRegion(page_index=page_index, rect=rect, label=str(len(self.session.regions) + 1))
+        region = QuestionRegion(page_index=page_index, rect=rect)
         self.session.regions.append(region)
+        self.session._refresh_order()
         self.session.selected_region_index = len(self.session.regions) - 1
         self.selected_region = region
         self.update_question_list()
