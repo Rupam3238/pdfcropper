@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-import fitz
+try:
+    import pymupdf as fitz
+except ImportError:  # pragma: no cover
+    import fitz
 from PyQt6.QtGui import QImage, QPixmap
 
 

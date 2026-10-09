@@ -7,7 +7,7 @@ try:
 except ImportError:  # pragma: no cover
     import fitz
 from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QAction, QKeySequence, QPainter, QPen, QColor
+from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -40,14 +40,24 @@ class ResizeHandle(QGraphicsRectItem):
         self.setBrush(QColor("#f4b942"))
         self.setPen(QPen(QColor("#f4b942"), 1))
         self.setZValue(30)
+        self.setFlag(self.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self._drag_start_scene = None
+        self._start_rect = None
+
+    def mousePressEvent(self, event):
+        self._drag_start_scene = event.scenePos()
+        self._start_rect = self.owner.rect().getRect()
+        event.accept()
 
     def mouseMoveEvent(self, event):
         if self.owner is None:
             return
-        handler = self.handle_name
-        current_scene = self.mapToScene(event.pos())
-        local_point = self.owner.mapFromScene(current_scene)
+        if self._drag_start_scene is None or self._start_rect is None:
+            return
 
+        handler = self.handle_name
+        scene_point = event.scenePos()
+        local_point = self.owner.mapFromScene(scene_point)
         rect = self.owner.rect().getRect()
         x0, y0, x1, y1 = rect
 
@@ -63,6 +73,12 @@ class ResizeHandle(QGraphicsRectItem):
         self.owner.setRect(QRectF(x0, y0, x1 - x0, y1 - y0))
         self.owner.update_region_from_rect()
         self.owner.sync_handles()
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start_scene = None
+        self._start_rect = None
+        event.accept()
 
 
 class QuestionRectItem(QGraphicsRectItem):
@@ -71,16 +87,24 @@ class QuestionRectItem(QGraphicsRectItem):
         self.region = region
         self.page_width = page_width
         self.page_height = page_height
-        self.setRect(QRectF(region.rect.x0, region.rect.y0, region.rect.x1 - region.rect.x0, region.rect.y1 - region.rect.y0))
+        self.setRect(QRectF(0, 0, max(1.0, region.rect.x1 - region.rect.x0), max(1.0, region.rect.y1 - region.rect.y0)))
+        self.setPos(region.rect.x0, region.rect.y0)
         self.setPen(QPen(QColor("#ff5a36"), 2))
         self.setBrush(QColor(255, 90, 54, 80))
         self.setFlag(self.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(self.GraphicsItemFlag.ItemIsMovable, True)
         self.setZValue(10)
-        self.label_item = QGraphicsSimpleTextItem(self)
+        self.label_background = QGraphicsRectItem(self)
+        self.label_background.setPen(QPen(Qt.PenStyle.NoPen))
+        self.label_background.setBrush(QColor("#202020"))
+        self.label_background.setZValue(20)
+        self.label_background.setFlag(self.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.label_item = QGraphicsSimpleTextItem(self.label_background)
         self.label_item.setText(str(region.label))
         self.label_item.setBrush(QColor("#ffffff"))
-        self.label_item.setPos(8, 8)
+        self.label_item.setPos(4, 2)
+        self.label_item.setFlag(self.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self._sync_label()
         self.handle_items = {}
         for name in ["top-left", "top", "top-right", "right", "bottom-right", "bottom", "bottom-left", "left"]:
             handle = ResizeHandle(self, name)
@@ -90,9 +114,19 @@ class QuestionRectItem(QGraphicsRectItem):
         self.sync_handles()
 
     def update_region_from_rect(self):
-        rect = self.rect().getRect()
-        self.region.rect = fitz.Rect(rect[0], rect[1], rect[2], rect[3])
+        origin = self.pos()
+        rect = self.rect()
+        x0 = origin.x() + rect.x()
+        y0 = origin.y() + rect.y()
+        x1 = origin.x() + rect.right()
+        y1 = origin.y() + rect.bottom()
+        self.region.rect = fitz.Rect(x0, y0, x1, y1)
         self.label_item.setText(str(self.region.label))
+        self._sync_label()
+
+    def _sync_label(self):
+        bounds = self.label_item.boundingRect()
+        self.label_background.setRect(0, 0, bounds.width() + 8, bounds.height() + 4)
 
     def sync_handles(self):
         for name, item in self.handle_items.items():
@@ -115,6 +149,9 @@ class QuestionRectItem(QGraphicsRectItem):
 
     def update_selection_state(self):
         visible = self.isSelected()
+        self.setPen(QPen(QColor("#36d6c5" if visible else "#ff5a36"), 3 if visible else 2))
+        self.label_background.setBrush(QColor("#f4b942" if visible else "#202020"))
+        self.label_item.setBrush(QColor("#202020" if visible else "#ffffff"))
         for handle in self.handle_items.values():
             handle.setVisible(visible)
 
@@ -148,6 +185,7 @@ class PdfPageView(QGraphicsView):
         self.rubber_band_rect = None
         self.start_scene_pos = None
         self.controller = None
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_controller(self, controller):
         self.controller = controller
@@ -176,14 +214,28 @@ class PdfPageView(QGraphicsView):
                 continue
             item = QuestionRectItem(region, page_rect.width, page_rect.height)
             self.scene.addItem(item)
-            item.setPos(region.rect.x0, region.rect.y0)
             item.sync_handles()
             if self.controller.selected_region and self.controller.selected_region is region:
                 item.setSelected(True)
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_1 and self.controller is not None:
+            self.controller.activate_drawing_mode()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape and self.rubber_band_rect is not None:
+            self.scene.removeItem(self.rubber_band_rect)
+            self.rubber_band_rect = None
+            self.start_scene_pos = None
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def mousePressEvent(self, event):
         if self.drawing_mode and event.button() == Qt.MouseButton.LeftButton:
             scene_pos = self.mapToScene(event.pos())
+            if not (0 <= scene_pos.x() <= self.page_size[0] and 0 <= scene_pos.y() <= self.page_size[1]):
+                return
             self.start_scene_pos = scene_pos
             self.rubber_band_rect = QGraphicsRectItem()
             self.rubber_band_rect.setPen(QPen(QColor("#43a047"), 2, Qt.PenStyle.DashLine))
@@ -196,6 +248,8 @@ class PdfPageView(QGraphicsView):
     def mouseMoveEvent(self, event):
         if self.drawing_mode and self.rubber_band_rect is not None:
             scene_pos = self.mapToScene(event.pos())
+            scene_pos.setX(min(max(scene_pos.x(), 0), self.page_size[0]))
+            scene_pos.setY(min(max(scene_pos.y(), 0), self.page_size[1]))
             rect = QRectF(self.start_scene_pos, scene_pos).normalized()
             self.rubber_band_rect.setRect(rect)
             return
@@ -203,18 +257,28 @@ class PdfPageView(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         if self.drawing_mode and self.rubber_band_rect is not None:
-            scene_rect = self.rubber_band_rect.rect()
+            rubber_band_rect = self.rubber_band_rect
+            scene_rect = rubber_band_rect.rect()
+            rect = None
             if scene_rect.width() > 2 and scene_rect.height() > 2:
                 x0, y0 = scene_to_page_point(scene_rect.topLeft(), zoom=1.0)
                 x1, y1 = scene_to_page_point(scene_rect.bottomRight(), zoom=1.0)
                 rect = fitz.Rect(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
-                self.controller.add_region_from_rect(self.page_index, rect)
-            self.scene.removeItem(self.rubber_band_rect)
+            self.scene.removeItem(rubber_band_rect)
             self.rubber_band_rect = None
             self.start_scene_pos = None
-            self.drawing_mode = False
+            if rect is not None:
+                self.controller.add_region_from_rect(self.page_index, rect)
             self.controller.update_question_list()
             return
+        if not self.drawing_mode and event.button() == Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.pos())
+            while item is not None and not isinstance(item, QuestionRectItem):
+                item = item.parentItem()
+            if item is None:
+                self.controller.clear_canvas_selection()
+            else:
+                self.controller.select_region_from_canvas(item.region)
         super().mouseReleaseEvent(event)
 
 
@@ -244,7 +308,16 @@ class PdfCropperMainWindow(QMainWindow):
         self.zoom_out_action = QAction("Zoom -", self)
         self.zoom_out_action.triggered.connect(lambda: self.zoom(1.0 / 1.25))
         self.draw_rect_action = QAction("Draw rectangle", self)
-        self.draw_rect_action.triggered.connect(self.toggle_drawing_mode)
+        self.draw_rect_action.setCheckable(True)
+        self.draw_rect_action.triggered.connect(self.activate_drawing_mode)
+        self.select_action = QAction("Select / edit", self)
+        self.select_action.setCheckable(True)
+        self.select_action.setChecked(True)
+        self.select_action.triggered.connect(self.activate_selection_mode)
+        self.tool_group = QActionGroup(self)
+        self.tool_group.setExclusive(True)
+        self.tool_group.addAction(self.select_action)
+        self.tool_group.addAction(self.draw_rect_action)
         self.delete_action = QAction("Delete", self)
         self.delete_action.triggered.connect(self.delete_selected_region)
         self.add_before_action = QAction("Add before", self)
@@ -265,6 +338,7 @@ class PdfCropperMainWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addAction(self.zoom_in_action)
         toolbar.addAction(self.zoom_out_action)
+        toolbar.addAction(self.select_action)
         toolbar.addAction(self.draw_rect_action)
         toolbar.addAction(self.add_before_action)
         toolbar.addAction(self.add_after_action)
@@ -294,6 +368,7 @@ class PdfCropperMainWindow(QMainWindow):
         layout.addWidget(right_panel, 1)
 
         self.setCentralWidget(central)
+        self.statusBar().showMessage("Mode: Select / edit")
 
     def open_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF files (*.pdf)")
@@ -331,9 +406,23 @@ class PdfCropperMainWindow(QMainWindow):
         current = self.viewer.zoom * factor
         self.viewer.set_zoom(current)
 
+    def activate_drawing_mode(self):
+        self.viewer.drawing_mode = True
+        self.viewer.setCursor(Qt.CursorShape.CrossCursor)
+        self.draw_rect_action.setChecked(True)
+        self.statusBar().showMessage("Mode: Draw rectangles (1) | Escape cancels the current rectangle")
+
+    def activate_selection_mode(self):
+        self.viewer.drawing_mode = False
+        self.viewer.setCursor(Qt.CursorShape.ArrowCursor)
+        self.select_action.setChecked(True)
+        self.statusBar().showMessage("Mode: Select / edit")
+
     def toggle_drawing_mode(self):
-        self.viewer.drawing_mode = not self.viewer.drawing_mode
-        self.draw_rect_action.setText("Draw rectangle on" if self.viewer.drawing_mode else "Draw rectangle")
+        if self.viewer.drawing_mode:
+            self.activate_selection_mode()
+        else:
+            self.activate_drawing_mode()
 
     def add_region_from_rect(self, page_index: int, rect):
         if rect.width <= 0 or rect.height <= 0:
@@ -345,6 +434,16 @@ class PdfCropperMainWindow(QMainWindow):
         self.selected_region = region
         self.update_question_list()
         self.show_page(page_index)
+
+    def select_region_from_canvas(self, region):
+        self.selected_region = region
+        self.session.selected_region_index = self.session.regions.index(region)
+        self.question_list.setCurrentRow(self.session.selected_region_index)
+
+    def clear_canvas_selection(self):
+        self.selected_region = None
+        self.session.selected_region_index = None
+        self.question_list.setCurrentRow(-1)
 
     def update_question_list(self):
         self.question_list.clear()
@@ -370,29 +469,54 @@ class PdfCropperMainWindow(QMainWindow):
 
     def add_before_selected(self):
         if not self.selected_region:
+            QMessageBox.information(self, "Select a question", "Select a question before adding one before it.")
             return
-        base_rect = self.selected_region.rect
-        new_rect = fitz.Rect(base_rect.x0, base_rect.y0, base_rect.x1, base_rect.y1)
-        new_region = QuestionRegion(page_index=self.selected_region.page_index, rect=new_rect, label=str(self.selected_region.label))
         index = self.session.regions.index(self.selected_region)
-        self.session.regions.insert(index, new_region)
-        self.session._refresh_order()
-        self.selected_region = new_region
-        self.update_question_list()
-        self.show_page(self.selected_region.page_index)
+        self._insert_region_at(index)
 
     def add_after_selected(self):
         if not self.selected_region:
+            QMessageBox.information(self, "Select a question", "Select a question before adding one after it.")
             return
         index = self.session.regions.index(self.selected_region)
-        base_rect = self.selected_region.rect
-        new_rect = fitz.Rect(base_rect.x0 + 20, base_rect.y0 + 20, base_rect.x1 + 20, base_rect.y1 + 20)
-        new_region = QuestionRegion(page_index=self.selected_region.page_index, rect=new_rect, label=str(self.selected_region.label))
-        self.session.regions.insert(index + 1, new_region)
+        self._insert_region_at(index + 1)
+
+    def _insert_region_at(self, index):
+        selected = self.selected_region
+        page_rect = self.pdf_service.page_rect(selected.page_index)
+        width = min(page_rect.width, max(40.0, selected.rect.width))
+        height = min(page_rect.height, max(40.0, selected.rect.height))
+        occupied = [region.rect for region in self.session.regions if region.page_index == selected.page_index]
+        step_x = max(1.0, min(width, height) / 2)
+        step_y = step_x
+        max_x = page_rect.width - width
+        max_y = page_rect.height - height
+        x_positions = list(range(0, int(max_x) + 1, int(step_x)))
+        y_positions = list(range(0, int(max_y) + 1, int(step_y)))
+        if not x_positions or x_positions[-1] < max_x:
+            x_positions.append(max_x)
+        if not y_positions or y_positions[-1] < max_y:
+            y_positions.append(max_y)
+        candidates = []
+        for y in y_positions:
+            for x in x_positions:
+                candidates.append(fitz.Rect(x, y, x + width, y + height))
+        new_rect = next(
+            (candidate for candidate in candidates if not any(candidate.intersects(other) for other in occupied)),
+            None,
+        )
+        if new_rect is None:
+            QMessageBox.information(self, "No room on page", "There is no free space on this page for another question region.")
+            return
+
+        new_region = QuestionRegion(page_index=selected.page_index, rect=new_rect)
+        self.session.regions.insert(index, new_region)
         self.session._refresh_order()
         self.selected_region = new_region
+        self.session.selected_region_index = index
         self.update_question_list()
-        self.show_page(self.selected_region.page_index)
+        self.question_list.setCurrentRow(index)
+        self.show_page(selected.page_index)
 
     def move_selected_up(self):
         if self.selected_region is None:

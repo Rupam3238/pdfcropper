@@ -7,6 +7,7 @@ try:
 except ImportError:  # pragma: no cover
     import fitz
 from PyQt6.QtWidgets import QApplication
+from reportlab.lib.colors import black
 from reportlab.lib.pagesizes import A4, letter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
@@ -55,9 +56,15 @@ def export_question_regions(document_path: str, regions, output_path: str, page_
 
     for region in regions:
         page = pdf[region.page_index]
-        clip = fitz.Rect(region.rect)
+        clip = fitz.Rect(region.rect).normalize()
+        if clip.is_empty or clip.width <= 0 or clip.height <= 0:
+            raise ValueError(f"Invalid region for page {region.page_index}: {region.rect}")
+        clip = clip & page.rect
+        if clip.is_empty or clip.width <= 0 or clip.height <= 0:
+            raise ValueError(f"Crop rectangle falls outside page {region.page_index}: {region.rect}")
+
         render_scale = max(2.0, min(4.0, 2400.0 / max(clip.width, clip.height, 1.0)))
-        pix = page.get_pixmap(matrix=fitz.Matrix(render_scale, render_scale), clip=clip, alpha=False)
+        pix = page.get_pixmap(matrix=fitz.Matrix(render_scale, render_scale), clip=clip, alpha=False, colorspace=fitz.csRGB)
 
         png_data = pix.tobytes("png")
         image_reader = ImageReader(BytesIO(png_data))
@@ -73,6 +80,8 @@ def export_question_regions(document_path: str, regions, output_path: str, page_
 
         x = margin
         y = page_height - margin - image_height
+        output.setFillColor(black)
+        output.rect(0, 0, page_width, page_height, fill=1, stroke=0)
         output.drawImage(
             image_reader,
             x,

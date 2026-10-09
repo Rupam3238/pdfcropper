@@ -1,4 +1,7 @@
-import fitz
+try:
+    import pymupdf as fitz
+except ImportError:  # pragma: no cover
+    import fitz
 
 from pdfcropper.geometry import page_to_scene_rect, scene_to_page_point
 
