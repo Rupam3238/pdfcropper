@@ -549,7 +549,7 @@ class PdfCropperMainWindow(QMainWindow):
         if not path:
             return
         try:
-            export_question_regions(self.current_file, self.session.regions, path, page_size="A4")
+            export_question_regions(self.current_file, self.session.regions, path)
             QMessageBox.information(self, "Export complete", f"Saved export to {path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))

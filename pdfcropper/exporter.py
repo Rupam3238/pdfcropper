@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 from io import BytesIO
+import math
 
 try:
     import pymupdf as fitz
 except ImportError:  # pragma: no cover
     import fitz
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QGuiApplication
 from reportlab.lib.colors import black
 from reportlab.lib.pagesizes import A4, letter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
+
+FALLBACK_PAGE_SIZE = A4
+DEFAULT_LOGICAL_DPI = 96.0
+_AUTO_SCREEN = object()
 
 
 def _page_size_tuple(page_size: str):
@@ -22,27 +27,71 @@ def _page_size_tuple(page_size: str):
     return A4
 
 
-def resolve_workspace_page_size(page_size: str | None = None):
-    """Return a workspace page size, using screen aspect ratio when available."""
+def display_dimensions_to_page_size(
+    logical_width: float,
+    logical_height: float,
+    device_pixel_ratio: float = 1.0,
+    logical_dpi: float = DEFAULT_LOGICAL_DPI,
+    physical_dpi: float | None = None,
+):
+    """Convert full screen dimensions to PDF points while preserving aspect ratio.
+
+    Screen geometry is in Qt logical pixels. When physical DPI is finite and
+    agrees with Qt's logical DPI after device scaling, physical pixels are
+    converted at 72 PDF points per physical inch. Otherwise the logical pixel
+    dimensions are converted at logical DPI. This avoids trusting broken
+    monitor DPI metadata while accounting for high-DPI scaling when reliable.
+    """
+    width = float(logical_width)
+    height = float(logical_height)
+    ratio = float(device_pixel_ratio)
+    logical_dpi = float(logical_dpi)
+    if not all(math.isfinite(value) and value > 0 for value in (width, height, ratio)):
+        return FALLBACK_PAGE_SIZE
+
+    if not math.isfinite(logical_dpi) or not 30 <= logical_dpi <= 600:
+        logical_dpi = DEFAULT_LOGICAL_DPI
+
+    physical_is_reliable = False
+    if physical_dpi is not None:
+        physical_dpi = float(physical_dpi)
+        if math.isfinite(physical_dpi) and 30 <= physical_dpi <= 1000:
+            effective_logical_dpi = physical_dpi / ratio
+            physical_is_reliable = (
+                50 <= effective_logical_dpi <= 300
+                and abs(effective_logical_dpi - logical_dpi) / logical_dpi <= 0.25
+            )
+
+    if physical_is_reliable:
+        return width * ratio * 72 / physical_dpi, height * ratio * 72 / physical_dpi
+    return width * 72 / logical_dpi, height * 72 / logical_dpi
+
+
+def _screen_to_workspace_page_size(screen):
+    if screen is None:
+        return FALLBACK_PAGE_SIZE
+    try:
+        geometry = screen.geometry()
+        return display_dimensions_to_page_size(
+            geometry.width(),
+            geometry.height(),
+            screen.devicePixelRatio(),
+            screen.logicalDotsPerInch(),
+            screen.physicalDotsPerInch(),
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError, OverflowError):
+        return FALLBACK_PAGE_SIZE
+
+
+def resolve_workspace_page_size(page_size: str | None = None, screen=_AUTO_SCREEN):
+    """Return explicit paper size or a full-display page size; headless fallback is A4."""
     if page_size and page_size.lower() not in {"screen", "auto", "default"}:
         return _page_size_tuple(page_size)
 
-    app = QApplication.instance()
-    screen = app.primaryScreen() if app is not None else None
-    if screen is not None:
-        geometry = screen.availableGeometry()
-        screen_w = max(1, geometry.width())
-        screen_h = max(1, geometry.height())
-        aspect_ratio = screen_w / screen_h
-        if aspect_ratio >= 1.0:
-            width = max(595, min(1800, screen_w * 0.72))
-            height = width / aspect_ratio
-        else:
-            height = max(842, min(1600, screen_h * 0.72))
-            width = height * aspect_ratio
-        return width, height
-
-    return A4
+    if screen is _AUTO_SCREEN:
+        app = QGuiApplication.instance()
+        screen = app.primaryScreen() if app is not None else None
+    return _screen_to_workspace_page_size(screen)
 
 
 def export_question_regions(document_path: str, regions, output_path: str, page_size: str | None = None, margin: int = 36):
