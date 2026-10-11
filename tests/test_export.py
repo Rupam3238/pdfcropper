@@ -9,6 +9,9 @@ except ImportError:  # pragma: no cover
 
 from pdfcropper.exporter import (
     FALLBACK_PAGE_SIZE,
+    QUESTION_IMAGE_INSET_PT,
+    QUESTION_IMAGE_MAX_HEIGHT_RATIO,
+    QUESTION_IMAGE_MAX_WIDTH_RATIO,
     display_dimensions_to_page_size,
     export_question_regions,
     resolve_workspace_page_size,
@@ -48,9 +51,30 @@ def test_export_creates_one_page_per_question(tmp_path):
     assert exported[0].rect.width == pytest.approx(595.28, abs=1)
     assert exported[0].rect.height == pytest.approx(841.89, abs=1)
     assert not exported[0].get_text().strip()
+    expected_crop_ratios = (260 / 170, 260 / 150)
+    for page, expected_ratio in zip(exported, expected_crop_ratios):
+        image_objects = page.get_images(full=True)
+        assert len(image_objects) == 1
+        image_xref, _, pixel_width, pixel_height = image_objects[0][:4]
+        assert "/Subtype /Image" in exported.xref_object(image_xref)
+        image_rects = page.get_image_rects(image_xref)
+        assert len(image_rects) == 1
+        image_rect = image_rects[0]
+        assert image_rect.x0 == pytest.approx(QUESTION_IMAGE_INSET_PT, abs=0.001)
+        assert image_rect.y0 == pytest.approx(QUESTION_IMAGE_INSET_PT, abs=0.001)
+        assert image_rect.width < page.rect.width
+        assert image_rect.height < page.rect.height
+        assert image_rect.width / image_rect.height == pytest.approx(expected_ratio, rel=1e-6)
+        assert pixel_width / pixel_height == pytest.approx(expected_ratio, rel=1e-12)
+        assert image_rect.width / page.rect.width <= QUESTION_IMAGE_MAX_WIDTH_RATIO + 1e-9
+        assert image_rect.height / page.rect.height <= QUESTION_IMAGE_MAX_HEIGHT_RATIO + 1e-9
+        assert any(
+            drawing["rect"] == page.rect and drawing["fill"] == (0.0, 0.0, 0.0)
+            for drawing in page.get_drawings()
+        )
     rendered = exported[0].get_pixmap()
     assert rendered.pixel(570, 800) == (0, 0, 0)
-    assert rendered.pixel(50, 50) == (255, 255, 255)
+    assert rendered.pixel(30, 30) == (255, 255, 255)
     exported.close()
 
 

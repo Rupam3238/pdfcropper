@@ -16,6 +16,9 @@ from reportlab.pdfgen import canvas
 FALLBACK_PAGE_SIZE = A4
 DEFAULT_LOGICAL_DPI = 96.0
 _AUTO_SCREEN = object()
+QUESTION_IMAGE_INSET_PT = 24.0
+QUESTION_IMAGE_MAX_WIDTH_RATIO = 0.42
+QUESTION_IMAGE_MAX_HEIGHT_RATIO = 0.32
 
 
 def _page_size_tuple(page_size: str):
@@ -94,8 +97,35 @@ def resolve_workspace_page_size(page_size: str | None = None, screen=_AUTO_SCREE
     return _screen_to_workspace_page_size(screen)
 
 
-def export_question_regions(document_path: str, regions, output_path: str, page_size: str | None = None, margin: int = 36):
-    """Export each question region as a page image in a new PDF, preserving order."""
+def resolve_question_image_placement(
+    page_width: float,
+    page_height: float,
+    image_width: int,
+    image_height: int,
+    inset: float = QUESTION_IMAGE_INSET_PT,
+):
+    """Return a top-left inset image rectangle in ReportLab's bottom-left coordinates."""
+    inset = max(0.0, float(inset))
+    left = min(inset, page_width / 2)
+    top = min(inset, page_height / 2)
+    max_width = min(page_width - left, page_width * QUESTION_IMAGE_MAX_WIDTH_RATIO)
+    max_height = min(page_height - top, page_height * QUESTION_IMAGE_MAX_HEIGHT_RATIO)
+    scale = min(max_width / image_width, max_height / image_height)
+    width = image_width * scale
+    height = image_height * scale
+    x = left
+    y = page_height - top - height
+    return x, y, width, height
+
+
+def export_question_regions(
+    document_path: str,
+    regions,
+    output_path: str,
+    page_size: str | None = None,
+    margin: float = QUESTION_IMAGE_INSET_PT,
+):
+    """Export each question region as a black workspace page with the cropped image placed at the upper-left."""
     if not regions:
         raise ValueError("No question rectangles selected for export.")
 
@@ -113,22 +143,19 @@ def export_question_regions(document_path: str, regions, output_path: str, page_
             raise ValueError(f"Crop rectangle falls outside page {region.page_index}: {region.rect}")
 
         render_scale = max(2.0, min(4.0, 2400.0 / max(clip.width, clip.height, 1.0)))
-        pix = page.get_pixmap(matrix=fitz.Matrix(render_scale, render_scale), clip=clip, alpha=False, colorspace=fitz.csRGB)
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(render_scale, render_scale),
+            clip=clip,
+            alpha=False,
+            colorspace=fitz.csRGB,
+        )
 
         png_data = pix.tobytes("png")
         image_reader = ImageReader(BytesIO(png_data))
 
-        target_width = max(120, page_width - (margin * 2))
-        target_height = max(120, page_height - (margin * 2))
-        crop_aspect = pix.width / max(pix.height, 1)
-        image_width = min(target_width, target_height * crop_aspect)
-        image_height = image_width / crop_aspect
-        if image_height > target_height:
-            image_height = target_height
-            image_width = image_height * crop_aspect
-
-        x = margin
-        y = page_height - margin - image_height
+        x, y, image_width, image_height = resolve_question_image_placement(
+            page_width, page_height, pix.width, pix.height, margin
+        )
         output.setFillColor(black)
         output.rect(0, 0, page_width, page_height, fill=1, stroke=0)
         output.drawImage(
