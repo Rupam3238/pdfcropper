@@ -7,7 +7,7 @@ try:
 except ImportError:  # pragma: no cover
     import fitz
 from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QPainter, QPen, QColor
+from PyQt6.QtGui import QAction, QActionGroup, QContextMenuEvent, QKeySequence, QPainter, QPen, QColor
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -99,11 +100,12 @@ class ResizeHandle(QGraphicsRectItem):
 
 
 class QuestionRectItem(QGraphicsRectItem):
-    def __init__(self, region, page_width, page_height):
+    def __init__(self, region, page_width, page_height, display_label=None):
         super().__init__()
         self.region = region
         self.page_width = page_width
         self.page_height = page_height
+        self.display_label = str(region.label if display_label is None else display_label)
         self.setRect(QRectF(0, 0, max(1.0, region.rect.x1 - region.rect.x0), max(1.0, region.rect.y1 - region.rect.y0)))
         self.setPos(region.rect.x0, region.rect.y0)
         self.setPen(QPen(QColor("#ff5a36"), 2))
@@ -117,7 +119,7 @@ class QuestionRectItem(QGraphicsRectItem):
         self.label_background.setZValue(20)
         self.label_background.setFlag(self.GraphicsItemFlag.ItemIgnoresTransformations, True)
         self.label_item = QGraphicsSimpleTextItem(self.label_background)
-        self.label_item.setText(str(region.label))
+        self.label_item.setText(self._display_label())
         self.label_item.setBrush(QColor("#ffffff"))
         self.label_item.setPos(4, 2)
         self.label_item.setFlag(self.GraphicsItemFlag.ItemIgnoresTransformations, True)
@@ -138,8 +140,14 @@ class QuestionRectItem(QGraphicsRectItem):
         x1 = origin.x() + rect.right()
         y1 = origin.y() + rect.bottom()
         self.region.rect = fitz.Rect(x0, y0, x1, y1)
-        self.label_item.setText(str(self.region.label))
+        self.label_item.setText(self._display_label())
         self._sync_label()
+
+    def _display_label(self):
+        part_order = getattr(self.region, "part_order", 0)
+        if part_order:
+            return f"{self.display_label}.{part_order + 1}"
+        return self.display_label
 
     def _sync_label(self):
         bounds = self.label_item.boundingRect()
@@ -274,7 +282,9 @@ class PdfPageView(QGraphicsView):
         for region in self.controller.session.regions:
             if region.page_index != page_index:
                 continue
-            item = QuestionRectItem(region, page_rect.width, page_rect.height)
+            root = self.controller.session.question_root(region.question_id)
+            display_label = root.label if root is not None else region.label
+            item = QuestionRectItem(region, page_rect.width, page_rect.height, display_label=display_label)
             self.scene.addItem(item)
             item.sync_handles()
             if self.controller.selected_region and self.controller.selected_region is region:
@@ -299,6 +309,15 @@ class PdfPageView(QGraphicsView):
         return min(0.95, max(0.05, float(scene_x) / max(self.page_size[0], 1.0)))
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self.controller is not None:
+            if self.controller.additional_region_question_id is not None:
+                if self.rubber_band_rect is not None:
+                    self.scene.removeItem(self.rubber_band_rect)
+                    self.rubber_band_rect = None
+                    self.start_scene_pos = None
+                self.controller.cancel_additional_region()
+                event.accept()
+                return
         if event.key() == Qt.Key.Key_1 and self.controller is not None:
             self.controller.activate_drawing_mode()
             event.accept()
@@ -382,6 +401,18 @@ class PdfPageView(QGraphicsView):
                 self.controller.select_region_from_canvas(item.region)
         super().mouseReleaseEvent(event)
 
+    def contextMenuEvent(self, event: QContextMenuEvent):
+        if self.controller is not None and self.controller.additional_region_question_id is None:
+            item = self.itemAt(event.pos())
+            while item is not None and not isinstance(item, QuestionRectItem):
+                item = item.parentItem()
+            if item is not None:
+                menu = self.controller.create_region_context_menu(item.region)
+                menu.exec(event.globalPos())
+                event.accept()
+                return
+        super().contextMenuEvent(event)
+
 
 class PdfCropperMainWindow(QMainWindow):
     def __init__(self):
@@ -391,6 +422,7 @@ class PdfCropperMainWindow(QMainWindow):
         self.selected_region = None
         self.current_file = None
         self.analysis_result: QuestionAnalysisRun | None = None
+        self.additional_region_question_id: str | None = None
         self.page_layout_settings: dict[int, PageLayoutOptions] = {}
         self._syncing_layout_controls = False
         self.build_ui()
@@ -535,6 +567,7 @@ class PdfCropperMainWindow(QMainWindow):
             return
         try:
             self.pdf_service.open(path)
+            self.cancel_additional_region()
             self.current_file = path
             page_count = self.pdf_service.page_count()
             self.session = DocumentSession(path=path, page_count=page_count)
@@ -847,6 +880,9 @@ class PdfCropperMainWindow(QMainWindow):
         self.statusBar().showMessage("Mode: Draw rectangles (1) | Escape cancels the current rectangle")
 
     def activate_selection_mode(self):
+        if self.additional_region_question_id is not None:
+            self.cancel_additional_region()
+            return
         self.viewer.drawing_mode = False
         self.viewer.setCursor(Qt.CursorShape.ArrowCursor)
         self.select_action.setChecked(True)
@@ -861,17 +897,35 @@ class PdfCropperMainWindow(QMainWindow):
     def add_region_from_rect(self, page_index: int, rect):
         if rect.width <= 0 or rect.height <= 0:
             return
+        if self.additional_region_question_id is not None:
+            question_id = self.additional_region_question_id
+            if self.session.question_root(question_id) is None:
+                self.cancel_additional_region()
+                self.statusBar().showMessage("The selected question no longer exists; additional region cancelled")
+                return
+            region = QuestionRegion(page_index=page_index, rect=rect, source="manual", question_id=question_id)
+            self.session.add_additional_region(question_id, region)
+            self.cancel_additional_region()
+            self.selected_region = region
+            self.update_question_list()
+            self.select_region_from_canvas(region)
+            self.show_page(page_index)
+            return
         region = QuestionRegion(page_index=page_index, rect=rect)
-        self.session.regions.append(region)
-        self.session._refresh_order()
-        self.session.selected_region_index = len(self.session.regions) - 1
+        self.session.add_region(region)
         self.selected_region = region
         self.update_question_list()
+        self.select_region_from_canvas(region)
         self.show_page(page_index)
 
     def select_region_from_canvas(self, region):
         self.selected_region = region
-        self.session.selected_region_index = self.session.regions.index(region)
+        root = self.session.question_root(region.question_id)
+        if root is None:
+            self.session.selected_region_index = None
+            self.question_list.setCurrentRow(-1)
+            return
+        self.session.selected_region_index = self.session.question_roots().index(root)
         self.question_list.setCurrentRow(self.session.selected_region_index)
 
     def clear_canvas_selection(self):
@@ -881,23 +935,92 @@ class PdfCropperMainWindow(QMainWindow):
 
     def update_question_list(self):
         self.question_list.clear()
-        for region in self.session.regions:
-            item = QListWidgetItem(f"Question {region.label} — page {region.page_index + 1}")
-            item.setData(32, region)
+        for root in self.session.question_roots():
+            parts = self.session.regions_for_question(root.question_id)
+            pages = ", ".join(str(index + 1) for index in dict.fromkeys(part.page_index for part in parts))
+            page_label = "page" if len(set(part.page_index for part in parts)) == 1 else "pages"
+            item = QListWidgetItem(f"Question {root.label} — {page_label} {pages} ({len(parts)} regions)")
+            item.setData(32, root)
             self.question_list.addItem(item)
 
     def select_region_from_list(self, item):
-        region = item.data(32)
-        self.selected_region = region
-        self.session.selected_region_index = self.session.regions.index(region)
-        self.show_page(region.page_index)
+        root = item.data(32)
+        if root is None:
+            return
+        self.select_region_from_canvas(root)
+        self.show_page(root.page_index)
+
+    def create_region_context_menu(self, region: QuestionRegion) -> QMenu:
+        self.select_region_from_canvas(region)
+        menu = QMenu(self)
+        menu.addAction(self.add_before_action)
+        menu.addAction(self.add_after_action)
+        menu.addAction(self.delete_action)
+        menu.addSeparator()
+        menu.addAction(self.move_up_action)
+        menu.addAction(self.move_down_action)
+        menu.addSeparator()
+        add_region_action = QAction("Add another region", menu)
+        add_region_action.triggered.connect(
+            lambda checked=False, question_id=region.question_id: self.begin_additional_region(question_id)
+        )
+        menu.addAction(add_region_action)
+        if region.part_order > 0:
+            remove_region_action = QAction("Remove this region", menu)
+            remove_region_action.triggered.connect(
+                lambda checked=False, selected=region: self.remove_additional_region(selected)
+            )
+            menu.addAction(remove_region_action)
+        return menu
+
+    def begin_additional_region(self, question_id: str):
+        root = self.session.question_root(question_id)
+        if root is None or self.pdf_service.document is None:
+            return
+        self.additional_region_question_id = question_id
+        self.viewer.drawing_mode = True
+        self.viewer.setFocus()
+        self.viewer.setCursor(Qt.CursorShape.CrossCursor)
+        self.draw_rect_action.setChecked(True)
+        self.statusBar().showMessage(
+            f"Adding a region to Question {root.label}; navigate to any page and draw it | Escape cancels"
+        )
+
+    def cancel_additional_region(self):
+        self.additional_region_question_id = None
+        if not hasattr(self, "viewer"):
+            return
+        if self.viewer.rubber_band_rect is not None:
+            self.viewer.scene.removeItem(self.viewer.rubber_band_rect)
+            self.viewer.rubber_band_rect = None
+            self.viewer.start_scene_pos = None
+        self.viewer.drawing_mode = False
+        self.viewer.setCursor(Qt.CursorShape.ArrowCursor)
+        if hasattr(self, "select_action"):
+            self.select_action.setChecked(True)
+            self.statusBar().showMessage("Mode: Select / edit")
+
+    def remove_additional_region(self, region: QuestionRegion):
+        if region.part_order <= 0 or region not in self.session.regions:
+            return
+        question_id = region.question_id
+        self.session.remove_region(region)
+        root = self.session.question_root(question_id)
+        self.selected_region = root
+        self.update_question_list()
+        if root is not None:
+            self.select_region_from_canvas(root)
+        self.show_page(self.session.current_page_index)
 
     def delete_selected_region(self):
         if self.selected_region is None:
             return
-        self.session.regions.remove(self.selected_region)
+        question_id = self.selected_region.question_id
+        if self.additional_region_question_id == question_id:
+            self.cancel_additional_region()
+        self.session.remove_question(question_id)
         self.selected_region = None
-        self.session._refresh_order()
+        self.session.selected_region_index = None
         self.update_question_list()
         self.show_page(self.session.current_page_index)
 
@@ -905,15 +1028,17 @@ class PdfCropperMainWindow(QMainWindow):
         if not self.selected_region:
             QMessageBox.information(self, "Select a question", "Select a question before adding one before it.")
             return
-        index = self.session.regions.index(self.selected_region)
+        parts = self.session.regions_for_question(self.selected_region.question_id)
+        index = self.session.regions.index(parts[0])
         self._insert_region_at(index)
 
     def add_after_selected(self):
         if not self.selected_region:
             QMessageBox.information(self, "Select a question", "Select a question before adding one after it.")
             return
-        index = self.session.regions.index(self.selected_region)
-        self._insert_region_at(index + 1)
+        parts = self.session.regions_for_question(self.selected_region.question_id)
+        index = self.session.regions.index(parts[-1]) + 1
+        self._insert_region_at(index)
 
     def _insert_region_at(self, index):
         selected = self.selected_region
@@ -955,22 +1080,22 @@ class PdfCropperMainWindow(QMainWindow):
     def move_selected_up(self):
         if self.selected_region is None:
             return
-        idx = self.session.regions.index(self.selected_region)
+        root = self.session.question_root(self.selected_region.question_id)
+        idx = self.session.question_roots().index(root)
         if idx > 0:
             self.session.move_region(idx, idx - 1)
-            self.selected_region = self.session.regions[idx - 1]
             self.update_question_list()
-            self.show_page(self.session.current_page_index)
+            self.select_region_from_canvas(self.selected_region)
 
     def move_selected_down(self):
         if self.selected_region is None:
             return
-        idx = self.session.regions.index(self.selected_region)
-        if idx < len(self.session.regions) - 1:
+        root = self.session.question_root(self.selected_region.question_id)
+        idx = self.session.question_roots().index(root)
+        if idx < len(self.session.question_roots()) - 1:
             self.session.move_region(idx, idx + 1)
-            self.selected_region = self.session.regions[idx + 1]
             self.update_question_list()
-            self.show_page(self.session.current_page_index)
+            self.select_region_from_canvas(self.selected_region)
 
     def export_selected(self):
         if self.pdf_service.document is None:

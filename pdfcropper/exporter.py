@@ -118,6 +118,69 @@ def resolve_question_image_placement(
     return x, y, width, height
 
 
+def _question_region_groups(regions):
+    groups: dict[object, list[object]] = {}
+    for index, region in enumerate(regions):
+        question_id = getattr(region, "question_id", None)
+        key = ("question", question_id) if question_id is not None else ("region", index)
+        groups.setdefault(key, []).append(region)
+    return [
+        sorted(parts, key=lambda region: getattr(region, "part_order", 0))
+        for parts in groups.values()
+    ]
+
+
+def _render_region(pdf, region):
+    page = pdf[region.page_index]
+    clip = fitz.Rect(region.rect).normalize()
+    if clip.is_empty or clip.width <= 0 or clip.height <= 0:
+        raise ValueError(f"Invalid region for page {region.page_index}: {region.rect}")
+    clip = clip & page.rect
+    if clip.is_empty or clip.width <= 0 or clip.height <= 0:
+        raise ValueError(f"Crop rectangle falls outside page {region.page_index}: {region.rect}")
+
+    render_scale = max(2.0, min(4.0, 2400.0 / max(clip.width, clip.height, 1.0)))
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(render_scale, render_scale),
+        clip=clip,
+        alpha=False,
+        colorspace=fitz.csRGB,
+    )
+    image_reader = ImageReader(BytesIO(pix.tobytes("png")))
+    return clip, pix, image_reader
+
+
+def _draw_region_group(canvas, pdf, page_width, page_height, parts, margin):
+    rendered = [_render_region(pdf, region) for region in parts]
+    inset = max(0.0, float(margin))
+    top = min(inset, page_height / 2)
+    left = min(inset, page_width / 2)
+    max_width = min(page_width - 2 * left, page_width * QUESTION_IMAGE_MAX_WIDTH_RATIO)
+    max_height = min(page_height - top, page_height * QUESTION_IMAGE_MAX_HEIGHT_RATIO)
+    gap = min(12.0, max_height / max(2 * len(rendered), 1))
+    gap_total = gap * (len(rendered) - 1)
+    max_source_width = max(clip.width for clip, _, _ in rendered)
+    total_source_height = sum(clip.height for clip, _, _ in rendered)
+    scale = min(max_width / max_source_width, (max_height - gap_total) / total_source_height)
+
+    canvas.setFillColor(black)
+    canvas.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+    cursor_top = page_height - top
+    for clip, _, image_reader in rendered:
+        width = clip.width * scale
+        height = clip.height * scale
+        cursor_top -= height
+        canvas.drawImage(
+            image_reader,
+            left,
+            cursor_top,
+            width=width,
+            height=height,
+            preserveAspectRatio=True,
+        )
+        cursor_top -= gap
+
+
 def export_question_regions(
     document_path: str,
     regions,
@@ -125,7 +188,7 @@ def export_question_regions(
     page_size: str | None = None,
     margin: float = QUESTION_IMAGE_INSET_PT,
 ):
-    """Export each question region as a black workspace page with the cropped image placed at the upper-left."""
+    """Export each question as one black workspace page with its crops stacked at the upper-left."""
     if not regions:
         raise ValueError("No question rectangles selected for export.")
 
@@ -133,39 +196,24 @@ def export_question_regions(
     page_width, page_height = resolve_workspace_page_size(page_size)
     output = canvas.Canvas(str(output_path), pagesize=(page_width, page_height))
 
-    for region in regions:
-        page = pdf[region.page_index]
-        clip = fitz.Rect(region.rect).normalize()
-        if clip.is_empty or clip.width <= 0 or clip.height <= 0:
-            raise ValueError(f"Invalid region for page {region.page_index}: {region.rect}")
-        clip = clip & page.rect
-        if clip.is_empty or clip.width <= 0 or clip.height <= 0:
-            raise ValueError(f"Crop rectangle falls outside page {region.page_index}: {region.rect}")
-
-        render_scale = max(2.0, min(4.0, 2400.0 / max(clip.width, clip.height, 1.0)))
-        pix = page.get_pixmap(
-            matrix=fitz.Matrix(render_scale, render_scale),
-            clip=clip,
-            alpha=False,
-            colorspace=fitz.csRGB,
-        )
-
-        png_data = pix.tobytes("png")
-        image_reader = ImageReader(BytesIO(png_data))
-
-        x, y, image_width, image_height = resolve_question_image_placement(
-            page_width, page_height, pix.width, pix.height, margin
-        )
-        output.setFillColor(black)
-        output.rect(0, 0, page_width, page_height, fill=1, stroke=0)
-        output.drawImage(
-            image_reader,
-            x,
-            y,
-            width=image_width,
-            height=image_height,
-            preserveAspectRatio=True,
-        )
+    for parts in _question_region_groups(regions):
+        if len(parts) > 1:
+            _draw_region_group(output, pdf, page_width, page_height, parts, margin)
+        else:
+            _, pix, image_reader = _render_region(pdf, parts[0])
+            x, y, image_width, image_height = resolve_question_image_placement(
+                page_width, page_height, pix.width, pix.height, margin
+            )
+            output.setFillColor(black)
+            output.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+            output.drawImage(
+                image_reader,
+                x,
+                y,
+                width=image_width,
+                height=image_height,
+                preserveAspectRatio=True,
+            )
         output.showPage()
 
     output.save()

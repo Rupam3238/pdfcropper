@@ -130,6 +130,94 @@ def test_export_uses_automatically_generated_region_through_existing_path(tmp_pa
     exported.close()
 
 
+def test_multiple_regions_from_different_pages_export_in_order_on_one_workspace_page(tmp_path):
+    source = tmp_path / "multi_part_source.pdf"
+    output = tmp_path / "multi_part_workspace.pdf"
+    document = fitz.open()
+    page = document.new_page(width=400, height=500)
+    page.draw_rect(fitz.Rect(20, 20, 220, 80), color=None, fill=(1, 0, 0))
+    page.draw_rect(fitz.Rect(20, 100, 100, 260), color=None, fill=(0, 1, 0))
+    page = document.new_page(width=400, height=500)
+    page.draw_rect(fitz.Rect(50, 50, 150, 150), color=None, fill=(0, 0, 1))
+    page = document.new_page(width=400, height=500)
+    page.draw_rect(fitz.Rect(80, 80, 180, 180), color=None, fill=(1, 1, 0))
+    document.save(source)
+    document.close()
+
+    question_id = "question-identity-not-label"
+    red_region = QuestionRegion(
+        page_index=0,
+        rect=fitz.Rect(20, 20, 220, 80),
+        label="misrecognized label",
+        question_id=question_id,
+        part_order=0,
+    )
+    blue_region = QuestionRegion(
+        page_index=1,
+        rect=fitz.Rect(50, 50, 150, 150),
+        label="duplicate label",
+        question_id=question_id,
+        part_order=1,
+    )
+    green_region = QuestionRegion(
+        page_index=0,
+        rect=fitz.Rect(20, 100, 100, 260),
+        label="",
+        question_id=question_id,
+        part_order=2,
+    )
+    other_question = QuestionRegion(
+        page_index=2,
+        rect=fitz.Rect(80, 80, 180, 180),
+        label="duplicate label",
+    )
+
+    export_question_regions(
+        str(source),
+        [green_region, red_region, other_question, blue_region],
+        str(output),
+        page_size="A4",
+    )
+
+    exported = fitz.open(output)
+    assert exported.page_count == 2
+    first_page = exported[0]
+    image_rects = []
+    for image_xref, *_ in first_page.get_images(full=True):
+        image_rects.extend(first_page.get_image_rects(image_xref))
+    image_rects.sort(key=lambda rect: rect.y0)
+    assert len(image_rects) == 3
+    expected_ratios = [200 / 60, 100 / 100, 80 / 160]
+    for rect, expected_ratio in zip(image_rects, expected_ratios):
+        assert rect.width / rect.height == pytest.approx(expected_ratio, rel=1e-6)
+        assert rect.x0 == pytest.approx(QUESTION_IMAGE_INSET_PT)
+        assert rect.x1 <= QUESTION_IMAGE_INSET_PT + first_page.rect.width * QUESTION_IMAGE_MAX_WIDTH_RATIO + 0.01
+        assert rect.y1 <= QUESTION_IMAGE_INSET_PT + first_page.rect.height * QUESTION_IMAGE_MAX_HEIGHT_RATIO + 0.01
+    assert all(
+        next_rect.y0 - previous_rect.y1 >= 11
+        for previous_rect, next_rect in zip(image_rects, image_rects[1:])
+    )
+
+    pixmap = first_page.get_pixmap()
+    expected_colors = [(255, 0, 0), (0, 0, 255), (0, 255, 0)]
+    for rect, expected_color in zip(image_rects, expected_colors):
+        center_x = round((rect.x0 + rect.x1) / 2)
+        center_y = round((rect.y0 + rect.y1) / 2)
+        actual_color = pixmap.pixel(center_x, center_y)
+        assert actual_color == expected_color
+
+    second_page_images = exported[1].get_images(full=True)
+    assert len(second_page_images) == 1
+    second_page_rect = exported[1].get_image_rects(second_page_images[0][0])[0]
+    second_pixmap = exported[1].get_pixmap()
+    second_color = second_pixmap.pixel(
+        round((second_page_rect.x0 + second_page_rect.x1) / 2),
+        round((second_page_rect.y0 + second_page_rect.y1) / 2),
+    )
+    assert second_color == (255, 255, 0)
+    exported.close()
+
+
 @pytest.mark.parametrize(
     ("width", "height", "device_pixel_ratio", "logical_dpi", "physical_dpi"),
     [

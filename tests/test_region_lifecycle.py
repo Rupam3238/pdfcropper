@@ -5,8 +5,8 @@ except ImportError:  # pragma: no cover
 
 import pytest
 from PyQt6.QtCore import QPointF, Qt
-from PyQt6.QtGui import QKeyEvent, QMouseEvent
-from PyQt6.QtWidgets import QApplication, QFileDialog, QGraphicsScene
+from PyQt6.QtGui import QContextMenuEvent, QKeyEvent, QMouseEvent
+from PyQt6.QtWidgets import QApplication, QFileDialog, QGraphicsScene, QMenu
 
 from pdfcropper.main_window import (
     ManualDividerItem,
@@ -52,6 +52,213 @@ def test_question_rect_item_move_and_resize_updates_geometry():
     assert item.region.rect.x0 >= 0
     assert item.region.rect.y0 >= 0
     assert item.label_item.text() == "2"
+
+
+def test_session_groups_ordered_regions_by_stable_identity_not_label():
+    original = QuestionRegion(page_index=0, rect=fitz.Rect(10, 20, 110, 120), label="same")
+    unrelated = QuestionRegion(page_index=2, rect=fitz.Rect(30, 40, 130, 140), label="same")
+    continuation = QuestionRegion(
+        page_index=2,
+        rect=fitz.Rect(150, 160, 250, 260),
+        label="continuation metadata stays local",
+        order=91,
+        question_id=original.question_id,
+        part_order=1,
+    )
+    session = DocumentSession(regions=[original, unrelated])
+    session.add_additional_region(original.question_id, continuation)
+
+    assert original.question_id != unrelated.question_id
+    assert session.question_roots() == [original, unrelated]
+    assert session.regions_for_question(original.question_id) == [original, continuation]
+    assert [(part.page_index, part.rect) for part in session.regions_for_question(original.question_id)] == [
+        (0, fitz.Rect(10, 20, 110, 120)),
+        (2, fitz.Rect(150, 160, 250, 260)),
+    ]
+    assert continuation.label == "continuation metadata stays local"
+    assert continuation.order == 91
+    assert [len(session.regions_for_question(root.question_id)) for root in session.question_roots()] == [2, 1]
+
+
+@pytest.mark.parametrize("target_page", [0, 2])
+def test_right_click_additional_region_draws_into_existing_question(tmp_path, monkeypatch, target_page):
+    app = QApplication.instance() or QApplication([])
+    source = tmp_path / f"additional_region_{target_page}.pdf"
+    document = fitz.open()
+    for _ in range(3):
+        document.new_page(width=500, height=700)
+    document.save(source)
+    document.close()
+
+    root = QuestionRegion(page_index=0, rect=fitz.Rect(40, 50, 170, 180))
+    other = QuestionRegion(page_index=1, rect=fitz.Rect(200, 250, 340, 390))
+    window = PdfCropperMainWindow()
+    window.pdf_service.open(str(source))
+    window.current_file = str(source)
+    window.session = DocumentSession(path=str(source), page_count=3, regions=[root, other])
+    window.update_question_list()
+    window.show_page(0)
+    window.show()
+    shown_menus = []
+    monkeypatch.setattr(QMenu, "exec", lambda menu, *args: shown_menus.append(menu))
+
+    viewport_point = window.viewer.mapFromScene(QPointF(80, 90))
+    context_event = QContextMenuEvent(
+        QContextMenuEvent.Reason.Mouse,
+        viewport_point,
+        window.viewer.viewport().mapToGlobal(viewport_point),
+    )
+    window.viewer.contextMenuEvent(context_event)
+
+    assert shown_menus
+    menu_action_texts = {action.text() for action in shown_menus[0].actions() if not action.isSeparator()}
+    assert {
+        "Add before",
+        "Add after",
+        "Delete",
+        "Move up",
+        "Move down",
+        "Add another region",
+    } <= menu_action_texts
+    add_action = next(action for action in shown_menus[0].actions() if action.text() == "Add another region")
+    add_action.trigger()
+    assert window.additional_region_question_id == root.question_id
+    assert window.viewer.drawing_mode
+    assert "Escape cancels" in window.statusBar().currentMessage()
+
+    for _ in range(target_page):
+        window.next_page()
+    assert window.viewer.page_index == target_page
+    window.viewer.start_scene_pos = QPointF(30, 40)
+    window.viewer.rubber_band_rect = window.viewer.scene.addRect(30, 40, 140, 110)
+    release_event = QMouseEvent(
+        QMouseEvent.Type.MouseButtonRelease,
+        QPointF(170, 150),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    window.viewer.mouseReleaseEvent(release_event)
+
+    group = window.session.regions_for_question(root.question_id)
+    assert len(group) == 2
+    assert group[0] is root
+    assert group[1].page_index == target_page
+    assert group[1].part_order == 1
+    assert group[1].rect == fitz.Rect(30, 40, 170, 150)
+    assert group[1].source == "manual"
+    assert len(window.session.question_roots()) == 2
+    assert window.question_list.count() == 2
+    assert not window.viewer.drawing_mode
+    assert window.additional_region_question_id is None
+
+    window.pdf_service.close()
+    window.close()
+
+
+def test_escape_cancels_additional_region_without_changing_question(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    source = tmp_path / "cancel_additional_region.pdf"
+    document = fitz.open()
+    document.new_page(width=500, height=700)
+    document.save(source)
+    document.close()
+
+    root = QuestionRegion(page_index=0, rect=fitz.Rect(40, 50, 170, 180))
+    window = PdfCropperMainWindow()
+    window.pdf_service.open(str(source))
+    window.current_file = str(source)
+    window.session = DocumentSession(path=str(source), page_count=1, regions=[root])
+    window.show_page(0)
+    window.begin_additional_region(root.question_id)
+    window.viewer.start_scene_pos = QPointF(20, 30)
+    window.viewer.rubber_band_rect = window.viewer.scene.addRect(20, 30, 100, 100)
+
+    event = QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
+    window.viewer.keyPressEvent(event)
+
+    assert window.session.regions == [root]
+    assert window.session.regions_for_question(root.question_id) == [root]
+    assert window.additional_region_question_id is None
+    assert window.viewer.rubber_band_rect is None
+    assert not window.viewer.drawing_mode
+
+    window.pdf_service.close()
+    window.close()
+
+
+def test_removing_additional_region_preserves_question_and_other_parts():
+    app = QApplication.instance() or QApplication([])
+    root = QuestionRegion(page_index=0, rect=fitz.Rect(10, 20, 100, 110))
+    first = QuestionRegion(page_index=1, rect=fitz.Rect(20, 30, 120, 130), question_id=root.question_id, part_order=1)
+    second = QuestionRegion(page_index=2, rect=fitz.Rect(30, 40, 130, 140), question_id=root.question_id, part_order=2)
+    window = PdfCropperMainWindow()
+    window.session = DocumentSession(page_count=3, regions=[root, first, second])
+    window.selected_region = first
+    window.remove_additional_region(first)
+
+    assert window.session.question_roots() == [root]
+    assert window.session.regions_for_question(root.question_id) == [root, second]
+    assert second.part_order == 1
+    assert window.selected_region is root
+    assert window.question_list.count() == 1
+    window.close()
+
+
+def test_delete_question_removes_original_and_all_additional_regions():
+    app = QApplication.instance() or QApplication([])
+    root = QuestionRegion(page_index=0, rect=fitz.Rect(10, 20, 100, 110))
+    continuation = QuestionRegion(
+        page_index=2,
+        rect=fitz.Rect(120, 130, 220, 230),
+        question_id=root.question_id,
+        part_order=1,
+    )
+    unrelated = QuestionRegion(page_index=1, rect=fitz.Rect(20, 30, 120, 130))
+    window = PdfCropperMainWindow()
+    window.session = DocumentSession(page_count=3, regions=[root, continuation, unrelated])
+    window.selected_region = continuation
+    window.delete_selected_region()
+
+    assert window.session.regions == [unrelated]
+    assert window.session.question_roots() == [unrelated]
+    window.close()
+
+
+def test_automatic_rerun_preserves_manual_continuation_without_orphaned_identity():
+    from types import SimpleNamespace
+
+    app = QApplication.instance() or QApplication([])
+    root = QuestionRegion(page_index=0, rect=fitz.Rect(10, 20, 100, 110), source="automatic")
+    continuation = QuestionRegion(
+        page_index=2,
+        rect=fitz.Rect(120, 130, 220, 230),
+        source="manual",
+        question_id=root.question_id,
+        part_order=1,
+    )
+    window = PdfCropperMainWindow()
+    window.session = DocumentSession(page_count=3, regions=[root, continuation])
+    proposal = SimpleNamespace(page_index=0, rect=fitz.Rect(30, 40, 130, 140))
+    result = SimpleNamespace(pages=[SimpleNamespace(
+        page_index=0,
+        failures=[],
+        rectangles=object(),
+        proposals=[proposal],
+    )])
+
+    created = window._replace_regions_from_successful_pages(result)
+
+    assert created == 1
+    assert continuation in window.session.regions
+    assert continuation.source == "manual"
+    assert continuation.question_id == root.question_id
+    assert continuation.part_order == 0
+    replacement = next(region for region in window.session.regions if region.source == "automatic")
+    assert replacement.question_id != continuation.question_id
+    assert window.session.regions_for_question(continuation.question_id) == [continuation]
+    assert len(window.session.question_roots()) == 2
+    window.close()
 
 
 def test_draw_mode_stays_active_until_selection_mode_is_chosen():
