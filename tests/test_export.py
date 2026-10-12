@@ -9,11 +9,19 @@ except ImportError:  # pragma: no cover
 
 from pdfcropper.exporter import (
     FALLBACK_PAGE_SIZE,
+    DEFAULT_EXPORT_SCALING_MODE,
+    CONSISTENT_TEXT_SIZE,
+    FIT_TO_AVAILABLE_AREA,
+    MAX_CONSISTENT_SCALE,
+    MIN_CONSISTENT_SCALE,
     QUESTION_IMAGE_INSET_PT,
     QUESTION_IMAGE_MAX_HEIGHT_RATIO,
     QUESTION_IMAGE_MAX_WIDTH_RATIO,
     display_dimensions_to_page_size,
+    calculate_consistent_scale,
+    estimate_region_text_size,
     export_question_regions,
+    resolve_question_image_placement,
     resolve_workspace_page_size,
 )
 from pdfcropper.main_window import _workspace_export_filename
@@ -60,7 +68,9 @@ def test_export_creates_one_page_per_question(tmp_path):
         QuestionRegion(page_index=1, rect=fitz.Rect(60, 80, 320, 230), label="2"),
     ]
 
-    export_question_regions(str(source), regions, str(output), page_size="A4")
+    export_question_regions(
+        str(source), regions, str(output), page_size="A4", scaling_mode=FIT_TO_AVAILABLE_AREA
+    )
     assert output.exists()
     exported = fitz.open(output)
     assert exported.page_count == 2
@@ -78,8 +88,15 @@ def test_export_creates_one_page_per_question(tmp_path):
         image_rects = page.get_image_rects(image_xref)
         assert len(image_rects) == 1
         image_rect = image_rects[0]
+        expected_x, expected_y, expected_width, expected_height = resolve_question_image_placement(
+            page.rect.width, page.rect.height, pixel_width, pixel_height, QUESTION_IMAGE_INSET_PT
+        )
         assert image_rect.x0 == pytest.approx(QUESTION_IMAGE_INSET_PT, abs=0.001)
         assert image_rect.y0 == pytest.approx(QUESTION_IMAGE_INSET_PT, abs=0.001)
+        assert image_rect.x0 == pytest.approx(expected_x, abs=0.001)
+        assert image_rect.y0 == pytest.approx(page.rect.height - expected_y - expected_height, abs=0.001)
+        assert image_rect.width == pytest.approx(expected_width, abs=0.001)
+        assert image_rect.height == pytest.approx(expected_height, abs=0.001)
         assert image_rect.width < page.rect.width
         assert image_rect.height < page.rect.height
         assert image_rect.width / image_rect.height == pytest.approx(expected_ratio, rel=1e-6)
@@ -93,6 +110,138 @@ def test_export_creates_one_page_per_question(tmp_path):
     rendered = exported[0].get_pixmap()
     assert rendered.pixel(570, 800) == (0, 0, 0)
     assert rendered.pixel(30, 30) == (255, 255, 255)
+    exported.close()
+
+
+def test_consistent_scaling_uses_pdf_text_span_geometry(tmp_path):
+    assert DEFAULT_EXPORT_SCALING_MODE == CONSISTENT_TEXT_SIZE
+    source = tmp_path / "font_sizes.pdf"
+    document = fitz.open()
+    page = document.new_page(width=500, height=700)
+    page.insert_text((40, 80), "Smaller source text", fontsize=10)
+    page.insert_text((40, 160), "Larger source text", fontsize=20)
+    document.save(source)
+    document.close()
+
+    pdf = fitz.open(source)
+    small_region = QuestionRegion(page_index=0, rect=fitz.Rect(20, 40, 350, 100))
+    large_region = QuestionRegion(page_index=0, rect=fitz.Rect(20, 120, 450, 180))
+    small_text_size = estimate_region_text_size(pdf, small_region)
+    large_text_size = estimate_region_text_size(pdf, large_region)
+    small_scale = calculate_consistent_scale(100, 40, small_text_size, 250, 260)
+    large_scale = calculate_consistent_scale(100, 40, large_text_size, 250, 260)
+    pdf.close()
+
+    assert small_text_size == pytest.approx(10)
+    assert large_text_size == pytest.approx(20)
+    assert small_scale == pytest.approx(1.5)
+    assert large_scale == pytest.approx(0.8)
+    assert small_text_size * small_scale == pytest.approx(15)
+    assert large_text_size * large_scale == pytest.approx(16)
+
+
+def test_consistent_scaling_uses_bounded_fallback_without_text_geometry(tmp_path):
+    source = tmp_path / "scanned_page.pdf"
+    document = fitz.open()
+    page = document.new_page(width=500, height=700)
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 40, 40), 0)
+    pixmap.clear_with(180)
+    page.insert_image(fitz.Rect(20, 20, 320, 320), stream=pixmap.tobytes("png"))
+    document.save(source)
+    document.close()
+
+    pdf = fitz.open(source)
+    scanned_region = QuestionRegion(page_index=0, rect=fitz.Rect(20, 20, 320, 320))
+    text_size = estimate_region_text_size(pdf, scanned_region)
+    fallback_scale = calculate_consistent_scale(300, 300, text_size, 250, 260)
+    small_fallback = calculate_consistent_scale(30, 40, None, 250, 260)
+    large_fallback = calculate_consistent_scale(500, 400, None, 250, 260)
+    pdf.close()
+
+    assert text_size is None
+    assert fallback_scale == pytest.approx(0.6)
+    assert small_fallback == pytest.approx(MAX_CONSISTENT_SCALE)
+    assert large_fallback == pytest.approx(MIN_CONSISTENT_SCALE)
+
+
+def test_consistent_scaling_respects_area_caps_and_preserves_aspect_ratio(tmp_path):
+    source = tmp_path / "scaling_bounds.pdf"
+    output = tmp_path / "consistent_bounds.pdf"
+    document = fitz.open()
+    page = document.new_page(width=1200, height=1400)
+    page.insert_text((30, 45), "Small text", fontsize=10)
+    page.insert_text((30, 1100), "Large crop text", fontsize=10)
+    document.save(source)
+    document.close()
+    regions = [
+        QuestionRegion(page_index=0, rect=fitz.Rect(20, 20, 120, 60)),
+        QuestionRegion(page_index=0, rect=fitz.Rect(20, 100, 1120, 1250)),
+    ]
+
+    export_question_regions(
+        str(source), regions, str(output), page_size="A4", scaling_mode=CONSISTENT_TEXT_SIZE
+    )
+
+    exported = fitz.open(output)
+    for page_index, region in enumerate(regions):
+        workspace_page = exported[page_index]
+        image_xref = workspace_page.get_images(full=True)[0][0]
+        image_rect = workspace_page.get_image_rects(image_xref)[0]
+        assert image_rect.width / image_rect.height == pytest.approx(
+            region.rect.width / region.rect.height, rel=1e-3
+        )
+        assert image_rect.x0 >= QUESTION_IMAGE_INSET_PT - 0.01
+        assert image_rect.y0 >= QUESTION_IMAGE_INSET_PT - 0.01
+        assert image_rect.x1 <= QUESTION_IMAGE_INSET_PT + workspace_page.rect.width * QUESTION_IMAGE_MAX_WIDTH_RATIO + 0.01
+        assert image_rect.y1 <= QUESTION_IMAGE_INSET_PT + workspace_page.rect.height * QUESTION_IMAGE_MAX_HEIGHT_RATIO + 0.01
+    exported.close()
+
+    too_large_scale = calculate_consistent_scale(1000, 900, 10, 200, 180)
+    assert too_large_scale == pytest.approx(0.2)
+    assert 1000 * too_large_scale <= 200
+    assert 900 * too_large_scale <= 180
+
+
+def test_large_grouped_crop_does_not_shrink_small_sibling_unnecessarily(tmp_path):
+    source = tmp_path / "uneven_group.pdf"
+    output = tmp_path / "uneven_group_workspace.pdf"
+    document = fitz.open()
+    page = document.new_page(width=500, height=900)
+    page.insert_text((40, 60), "Tall region text", fontsize=10)
+    page.insert_text((40, 710), "Short region text", fontsize=10)
+    document.save(source)
+    document.close()
+
+    question_id = "uneven-group"
+    tall_region = QuestionRegion(
+        page_index=0,
+        rect=fitz.Rect(20, 20, 120, 620),
+        question_id=question_id,
+        part_order=0,
+    )
+    short_region = QuestionRegion(
+        page_index=0,
+        rect=fitz.Rect(20, 670, 120, 740),
+        question_id=question_id,
+        part_order=1,
+    )
+    export_question_regions(
+        str(source), [tall_region, short_region], str(output), page_size="A4",
+        scaling_mode=CONSISTENT_TEXT_SIZE,
+    )
+
+    exported = fitz.open(output)
+    assert exported.page_count == 1
+    workspace_page = exported[0]
+    image_rects = []
+    for image_xref, *_ in workspace_page.get_images(full=True):
+        image_rects.extend(workspace_page.get_image_rects(image_xref))
+    image_rects.sort(key=lambda rect: rect.y0)
+
+    assert len(image_rects) == 2
+    assert image_rects[0].height <= workspace_page.rect.height * QUESTION_IMAGE_MAX_HEIGHT_RATIO / 2 + 0.1
+    assert image_rects[1].height == pytest.approx(70 * MAX_CONSISTENT_SCALE)
+    assert image_rects[0].y1 <= image_rects[1].y0
     exported.close()
 
 
@@ -133,6 +282,7 @@ def test_export_uses_automatically_generated_region_through_existing_path(tmp_pa
 def test_multiple_regions_from_different_pages_export_in_order_on_one_workspace_page(tmp_path):
     source = tmp_path / "multi_part_source.pdf"
     output = tmp_path / "multi_part_workspace.pdf"
+    fit_output = tmp_path / "multi_part_fit_workspace.pdf"
     document = fitz.open()
     page = document.new_page(width=400, height=500)
     page.draw_rect(fitz.Rect(20, 20, 220, 80), color=None, fill=(1, 0, 0))
@@ -216,6 +366,25 @@ def test_multiple_regions_from_different_pages_export_in_order_on_one_workspace_
     )
     assert second_color == (255, 255, 0)
     exported.close()
+
+    export_question_regions(
+        str(source),
+        [green_region, red_region, other_question, blue_region],
+        str(fit_output),
+        page_size="A4",
+        scaling_mode=FIT_TO_AVAILABLE_AREA,
+    )
+    fit_exported = fitz.open(fit_output)
+    assert fit_exported.page_count == 2
+    fit_first_images = fit_exported[0].get_images(full=True)
+    assert len(fit_first_images) == 3
+    fit_first_rects = [fit_exported[0].get_image_rects(item[0])[0] for item in fit_first_images]
+    fit_first_rects.sort(key=lambda rect: rect.y0)
+    assert all(
+        rect.width / rect.height == pytest.approx(ratio, rel=1e-6)
+        for rect, ratio in zip(fit_first_rects, expected_ratios)
+    )
+    fit_exported.close()
 
 
 @pytest.mark.parametrize(

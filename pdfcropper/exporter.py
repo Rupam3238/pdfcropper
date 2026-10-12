@@ -19,6 +19,14 @@ _AUTO_SCREEN = object()
 QUESTION_IMAGE_INSET_PT = 24.0
 QUESTION_IMAGE_MAX_WIDTH_RATIO = 0.42
 QUESTION_IMAGE_MAX_HEIGHT_RATIO = 0.32
+FIT_TO_AVAILABLE_AREA = "fit_to_available_area"
+CONSISTENT_TEXT_SIZE = "consistent_text_size"
+DEFAULT_EXPORT_SCALING_MODE = CONSISTENT_TEXT_SIZE
+MIN_CONSISTENT_SCALE = 0.5
+MAX_CONSISTENT_SCALE = 1.5
+TARGET_TEXT_SIZE_PT = 16.0
+FALLBACK_CROP_HEIGHT_PT = 180.0
+MULTI_REGION_GAP_PT = 12.0
 
 
 def _page_size_tuple(page_size: str):
@@ -150,7 +158,64 @@ def _render_region(pdf, region):
     return clip, pix, image_reader
 
 
-def _draw_region_group(canvas, pdf, page_width, page_height, parts, margin):
+def estimate_region_text_size(pdf, region) -> float | None:
+    """Estimate text size from PDF spans intersecting a source crop, if available."""
+    page = pdf[region.page_index]
+    clip = fitz.Rect(region.rect).normalize() & page.rect
+    if clip.is_empty:
+        return None
+    sizes = []
+    try:
+        blocks = page.get_text("dict", clip=clip).get("blocks", [])
+    except (RuntimeError, ValueError):
+        return None
+    for block in blocks:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                if not str(span.get("text", "")).strip():
+                    continue
+                try:
+                    size = float(span.get("size", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(size) and 1.0 <= size <= 96.0:
+                    sizes.append(size)
+    if not sizes:
+        return None
+    sizes.sort()
+    middle = len(sizes) // 2
+    if len(sizes) % 2:
+        return sizes[middle]
+    return (sizes[middle - 1] + sizes[middle]) / 2
+
+
+def calculate_consistent_scale(
+    crop_width: float,
+    crop_height: float,
+    text_size: float | None,
+    max_width: float,
+    max_height: float,
+) -> float:
+    """Choose a bounded scale from text geometry, or crop height when text is absent."""
+    if text_size is not None and math.isfinite(text_size) and text_size > 0:
+        requested = TARGET_TEXT_SIZE_PT / text_size
+    else:
+        requested = FALLBACK_CROP_HEIGHT_PT / max(float(crop_height), 1.0)
+    requested = min(MAX_CONSISTENT_SCALE, max(MIN_CONSISTENT_SCALE, requested))
+    area_limit = min(float(max_width) / crop_width, float(max_height) / crop_height)
+    return min(requested, area_limit)
+
+
+def _workspace_crop_area(page_width, page_height, margin):
+    inset = max(0.0, float(margin))
+    left = min(inset, page_width / 2)
+    top = min(inset, page_height / 2)
+    max_width = min(page_width - 2 * left, page_width * QUESTION_IMAGE_MAX_WIDTH_RATIO)
+    max_height = min(page_height - top, page_height * QUESTION_IMAGE_MAX_HEIGHT_RATIO)
+    return left, top, max_width, max_height
+
+
+def _draw_region_group_fit(canvas, pdf, page_width, page_height, parts, margin):
     rendered = [_render_region(pdf, region) for region in parts]
     inset = max(0.0, float(margin))
     top = min(inset, page_height / 2)
@@ -181,16 +246,54 @@ def _draw_region_group(canvas, pdf, page_width, page_height, parts, margin):
         cursor_top -= gap
 
 
+def _draw_region_group_consistent(canvas, pdf, page_width, page_height, parts, margin):
+    rendered = [_render_region(pdf, region) for region in parts]
+    left, top, max_width, max_height = _workspace_crop_area(page_width, page_height, margin)
+    gap = min(MULTI_REGION_GAP_PT, max_height / max(2 * len(rendered), 1))
+    available_height = max_height - gap * (len(rendered) - 1)
+    per_region_height = available_height / len(rendered)
+    scales = [
+        calculate_consistent_scale(
+            clip.width,
+            clip.height,
+            estimate_region_text_size(pdf, region),
+            max_width,
+            per_region_height,
+        )
+        for region, (clip, _, _) in zip(parts, rendered)
+    ]
+    heights = [clip.height * scale for (clip, _, _), scale in zip(rendered, scales)]
+
+    canvas.setFillColor(black)
+    canvas.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+    cursor_top = page_height - top
+    for (clip, _, image_reader), scale, height in zip(rendered, scales, heights):
+        width = clip.width * scale
+        cursor_top -= height
+        canvas.drawImage(
+            image_reader,
+            left,
+            cursor_top,
+            width=width,
+            height=height,
+            preserveAspectRatio=True,
+        )
+        cursor_top -= gap
+
+
 def export_question_regions(
     document_path: str,
     regions,
     output_path: str,
     page_size: str | None = None,
     margin: float = QUESTION_IMAGE_INSET_PT,
+    scaling_mode: str = DEFAULT_EXPORT_SCALING_MODE,
 ):
     """Export each question as one black workspace page with its crops stacked at the upper-left."""
     if not regions:
         raise ValueError("No question rectangles selected for export.")
+    if scaling_mode not in {FIT_TO_AVAILABLE_AREA, CONSISTENT_TEXT_SIZE}:
+        raise ValueError(f"Unsupported export scaling mode: {scaling_mode!r}.")
 
     pdf = fitz.open(document_path)
     page_width, page_height = resolve_workspace_page_size(page_size)
@@ -198,12 +301,32 @@ def export_question_regions(
 
     for parts in _question_region_groups(regions):
         if len(parts) > 1:
-            _draw_region_group(output, pdf, page_width, page_height, parts, margin)
-        else:
-            _, pix, image_reader = _render_region(pdf, parts[0])
-            x, y, image_width, image_height = resolve_question_image_placement(
-                page_width, page_height, pix.width, pix.height, margin
+            draw_group = (
+                _draw_region_group_fit
+                if scaling_mode == FIT_TO_AVAILABLE_AREA
+                else _draw_region_group_consistent
             )
+            draw_group(output, pdf, page_width, page_height, parts, margin)
+        else:
+            region = parts[0]
+            clip, pix, image_reader = _render_region(pdf, region)
+            if scaling_mode == FIT_TO_AVAILABLE_AREA:
+                x, y, image_width, image_height = resolve_question_image_placement(
+                    page_width, page_height, pix.width, pix.height, margin
+                )
+            else:
+                left, top, max_width, max_height = _workspace_crop_area(page_width, page_height, margin)
+                scale = calculate_consistent_scale(
+                    clip.width,
+                    clip.height,
+                    estimate_region_text_size(pdf, region),
+                    max_width,
+                    max_height,
+                )
+                image_width = clip.width * scale
+                image_height = clip.height * scale
+                x = left
+                y = page_height - top - image_height
             output.setFillColor(black)
             output.rect(0, 0, page_width, page_height, fill=1, stroke=0)
             output.drawImage(

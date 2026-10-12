@@ -6,7 +6,7 @@ except ImportError:  # pragma: no cover
 import pytest
 from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtGui import QContextMenuEvent, QKeyEvent, QMouseEvent
-from PyQt6.QtWidgets import QApplication, QFileDialog, QGraphicsScene, QMenu
+from PyQt6.QtWidgets import QApplication, QFileDialog, QGraphicsScene, QMenu, QMessageBox
 
 from pdfcropper.main_window import (
     ManualDividerItem,
@@ -14,6 +14,7 @@ from pdfcropper.main_window import (
     PdfPageView,
     QuestionRectItem,
 )
+from pdfcropper.exporter import CONSISTENT_TEXT_SIZE, FIT_TO_AVAILABLE_AREA
 from pdfcropper.models import DocumentSession, QuestionRegion
 from pdfcropper.pipeline import PageLayoutMode, PageLayoutOptions
 
@@ -450,6 +451,40 @@ def test_export_dialog_default_updates_when_source_pdf_changes(tmp_path, monkeyp
         "Laws of motion_workspaces.pdf",
         "Chapter 1.v2_workspaces.pdf",
     ]
+    window.pdf_service.close()
+    window.close()
+
+
+def test_export_scaling_selector_defaults_to_consistent_and_passes_selected_mode(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    source = tmp_path / "scaling_modes.pdf"
+    document = fitz.open()
+    page = document.new_page(width=595, height=842)
+    page.insert_text((40, 70), "Question text")
+    document.save(source)
+    document.close()
+    window = PdfCropperMainWindow()
+    window.pdf_service.open(str(source))
+    window.current_file = str(source)
+    window.session = DocumentSession(
+        path=str(source),
+        page_count=1,
+        regions=[QuestionRegion(page_index=0, rect=fitz.Rect(20, 30, 240, 140))],
+    )
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(tmp_path / "out.pdf"), ""))
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: None)
+    calls = []
+    monkeypatch.setattr(
+        "pdfcropper.main_window.export_question_regions",
+        lambda *args, **kwargs: calls.append(kwargs["scaling_mode"]),
+    )
+
+    assert window.export_scaling_combo.currentData() == CONSISTENT_TEXT_SIZE
+    window.export_selected()
+    window.export_scaling_combo.setCurrentIndex(window.export_scaling_combo.findData(FIT_TO_AVAILABLE_AREA))
+    window.export_selected()
+
+    assert calls == [CONSISTENT_TEXT_SIZE, FIT_TO_AVAILABLE_AREA]
     window.pdf_service.close()
     window.close()
 

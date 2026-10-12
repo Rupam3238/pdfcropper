@@ -32,7 +32,12 @@ from PyQt6.QtWidgets import (
 )
 
 from .analysis import page_indices_for_range
-from .exporter import export_question_regions
+from .exporter import (
+    CONSISTENT_TEXT_SIZE,
+    DEFAULT_EXPORT_SCALING_MODE,
+    FIT_TO_AVAILABLE_AREA,
+    export_question_regions,
+)
 from .geometry import clamp_rect, page_to_scene_rect, scene_to_page_point
 from .models import DocumentSession, QuestionRegion
 from .pipeline import (
@@ -533,6 +538,14 @@ class PdfCropperMainWindow(QMainWindow):
         self.analysis_diagnostics.setMaximumHeight(150)
         self.analysis_diagnostics.setPlaceholderText("Page warnings and ambiguities will appear here")
         right_layout.addWidget(self.analysis_diagnostics)
+        right_layout.addWidget(QLabel("Export scaling"))
+        self.export_scaling_combo = QComboBox()
+        self.export_scaling_combo.addItem("Consistent text size", CONSISTENT_TEXT_SIZE)
+        self.export_scaling_combo.addItem("Fit to available area", FIT_TO_AVAILABLE_AREA)
+        self.export_scaling_combo.setCurrentIndex(
+            self.export_scaling_combo.findData(DEFAULT_EXPORT_SCALING_MODE)
+        )
+        right_layout.addWidget(self.export_scaling_combo)
         right_layout.addWidget(QLabel("Page layout"))
         self.page_layout_combo = QComboBox()
         self.page_layout_combo.addItem("Automatic", PageLayoutMode.AUTOMATIC)
@@ -1109,7 +1122,12 @@ class PdfCropperMainWindow(QMainWindow):
         if not path:
             return
         try:
-            export_question_regions(self.current_file, self.session.regions, path)
+            export_question_regions(
+                self.current_file,
+                self.session.regions,
+                path,
+                scaling_mode=self.export_scaling_combo.currentData(),
+            )
             QMessageBox.information(self, "Export complete", f"Saved export to {path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
