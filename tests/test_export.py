@@ -16,6 +16,7 @@ from pdfcropper.exporter import (
     export_question_regions,
     resolve_workspace_page_size,
 )
+from pdfcropper.main_window import _workspace_export_filename
 from pdfcropper.models import QuestionRegion
 
 
@@ -30,6 +31,23 @@ def _write_test_pdf(path: Path):
     page.insert_text((50, 150), "Delta epsilon zeta")
     doc.save(path)
     doc.close()
+
+
+@pytest.mark.parametrize(
+    ("source_path", "expected"),
+    [
+        ("Laws of motion.pdf", "Laws of motion_workspaces.pdf"),
+        ("Relations and Functions.pdf", "Relations and Functions_workspaces.pdf"),
+        ("Physics Chapter 1.pdf", "Physics Chapter 1_workspaces.pdf"),
+        ("Chapter 1.v2.pdf", "Chapter 1.v2_workspaces.pdf"),
+    ],
+)
+def test_workspace_export_filename_uses_source_stem(source_path, expected):
+    assert _workspace_export_filename(source_path) == expected
+
+
+def test_workspace_export_filename_uses_fallback_without_source():
+    assert _workspace_export_filename(None) == "question_workspaces.pdf"
 
 
 def test_export_creates_one_page_per_question(tmp_path):
@@ -91,6 +109,25 @@ def test_export_rejects_invalid_crop_rectangles(tmp_path):
     for region in invalid_regions:
         with pytest.raises(ValueError):
             export_question_regions(str(source), [region], str(output), page_size="A4")
+
+
+def test_export_uses_automatically_generated_region_through_existing_path(tmp_path):
+    source = tmp_path / "source.pdf"
+    output = tmp_path / "automatic_region.pdf"
+    _write_test_pdf(source)
+    generated_region = QuestionRegion(
+        page_index=1,
+        rect=fitz.Rect(40, 70, 300, 230),
+        label="1",
+        source="automatic",
+    )
+
+    export_question_regions(str(source), [generated_region], str(output), page_size="A4")
+
+    exported = fitz.open(output)
+    assert exported.page_count == 1
+    assert exported[0].get_images()
+    exported.close()
 
 
 @pytest.mark.parametrize(
