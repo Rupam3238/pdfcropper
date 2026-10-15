@@ -10,6 +10,8 @@ A lightweight desktop tool for turning a multi-question PDF into a set of single
 - Reorder questions independently of page position
 - Export one workspace page per selected question
 - Keep a blank area for handwriting on each page
+- Exported question images are image annotations (not flattened), so they can be moved and resized in Charta/Okular
+- Question images are scaled so text ends up about the same size on every page; large crops get more room
 
 ## Requirements
 

@@ -10,13 +10,16 @@ except ImportError:  # pragma: no cover
 from pdfcropper.exporter import (
     FALLBACK_PAGE_SIZE,
     DEFAULT_EXPORT_SCALING_MODE,
+    CONSISTENT_MAX_HEIGHT_RATIO,
     CONSISTENT_TEXT_SIZE,
+    DEFAULT_ASSUMED_TEXT_SIZE_PT,
     FIT_TO_AVAILABLE_AREA,
     MAX_CONSISTENT_SCALE,
     MIN_CONSISTENT_SCALE,
     QUESTION_IMAGE_INSET_PT,
     QUESTION_IMAGE_MAX_HEIGHT_RATIO,
     QUESTION_IMAGE_MAX_WIDTH_RATIO,
+    TARGET_TEXT_SIZE_PT,
     display_dimensions_to_page_size,
     calculate_consistent_scale,
     estimate_region_text_size,
@@ -39,6 +42,24 @@ def _write_test_pdf(path: Path):
     page.insert_text((50, 150), "Delta epsilon zeta")
     doc.save(path)
     doc.close()
+
+
+def _image_annotations(document, page):
+    """Return (rect, pixel_width, pixel_height) for each image annotation on a page."""
+    found = []
+    for annot in page.annots() or []:
+        assert annot.type[1] == "Square"
+        kind, ap_ref = document.xref_get_key(annot.xref, "AP/N")
+        assert kind == "xref"
+        ap_xref = int(ap_ref.split()[0])
+        kind, image_ref = document.xref_get_key(ap_xref, "Resources/XObject/Im0")
+        assert kind == "xref"
+        image_xref = int(image_ref.split()[0])
+        assert "/Subtype /Image" in document.xref_object(image_xref)
+        pixel_width = int(document.xref_get_key(image_xref, "Width")[1])
+        pixel_height = int(document.xref_get_key(image_xref, "Height")[1])
+        found.append((fitz.Rect(annot.rect), pixel_width, pixel_height))
+    return sorted(found, key=lambda item: item[0].y0)
 
 
 @pytest.mark.parametrize(
@@ -74,20 +95,19 @@ def test_export_creates_one_page_per_question(tmp_path):
     assert output.exists()
     exported = fitz.open(output)
     assert exported.page_count == 2
-    assert exported[0].get_images()
-    assert exported[1].get_images()
     assert exported[0].rect.width == pytest.approx(595.28, abs=1)
     assert exported[0].rect.height == pytest.approx(841.89, abs=1)
     assert not exported[0].get_text().strip()
     expected_crop_ratios = (260 / 170, 260 / 150)
     for page, expected_ratio in zip(exported, expected_crop_ratios):
-        image_objects = page.get_images(full=True)
+        # The image is a movable annotation, not flattened into the page content.
+        assert not page.get_images()
+        image_objects = _image_annotations(exported, page)
         assert len(image_objects) == 1
-        image_xref, _, pixel_width, pixel_height = image_objects[0][:4]
-        assert "/Subtype /Image" in exported.xref_object(image_xref)
-        image_rects = page.get_image_rects(image_xref)
-        assert len(image_rects) == 1
-        image_rect = image_rects[0]
+        image_rect, pixel_width, pixel_height = image_objects[0]
+        (annot,) = list(page.annots())
+        assert annot.flags == 4
+        assert exported.xref_get_key(annot.xref, "BS/W")[1] == "0"
         expected_x, expected_y, expected_width, expected_height = resolve_question_image_placement(
             page.rect.width, page.rect.height, pixel_width, pixel_height, QUESTION_IMAGE_INSET_PT
         )
@@ -140,7 +160,7 @@ def test_consistent_scaling_uses_pdf_text_span_geometry(tmp_path):
     assert large_text_size * large_scale == pytest.approx(16)
 
 
-def test_consistent_scaling_uses_bounded_fallback_without_text_geometry(tmp_path):
+def test_consistent_scaling_uses_assumed_text_size_without_text_geometry(tmp_path):
     source = tmp_path / "scanned_page.pdf"
     document = fitz.open()
     page = document.new_page(width=500, height=700)
@@ -158,10 +178,13 @@ def test_consistent_scaling_uses_bounded_fallback_without_text_geometry(tmp_path
     large_fallback = calculate_consistent_scale(500, 400, None, 250, 260)
     pdf.close()
 
+    assumed_scale = TARGET_TEXT_SIZE_PT / DEFAULT_ASSUMED_TEXT_SIZE_PT
+
     assert text_size is None
-    assert fallback_scale == pytest.approx(0.6)
-    assert small_fallback == pytest.approx(MAX_CONSISTENT_SCALE)
-    assert large_fallback == pytest.approx(MIN_CONSISTENT_SCALE)
+    # Without text the scale no longer depends on the crop's height: big crops get big space.
+    assert small_fallback == pytest.approx(assumed_scale)
+    assert fallback_scale == pytest.approx(250 / 300)  # only the area cap shrinks it
+    assert large_fallback == pytest.approx(MIN_CONSISTENT_SCALE)  # 250 / 500
 
 
 def test_consistent_scaling_respects_area_caps_and_preserves_aspect_ratio(tmp_path):
@@ -185,15 +208,18 @@ def test_consistent_scaling_respects_area_caps_and_preserves_aspect_ratio(tmp_pa
     exported = fitz.open(output)
     for page_index, region in enumerate(regions):
         workspace_page = exported[page_index]
-        image_xref = workspace_page.get_images(full=True)[0][0]
-        image_rect = workspace_page.get_image_rects(image_xref)[0]
+        image_rect = _image_annotations(exported, workspace_page)[0][0]
         assert image_rect.width / image_rect.height == pytest.approx(
             region.rect.width / region.rect.height, rel=1e-3
         )
         assert image_rect.x0 >= QUESTION_IMAGE_INSET_PT - 0.01
         assert image_rect.y0 >= QUESTION_IMAGE_INSET_PT - 0.01
-        assert image_rect.x1 <= QUESTION_IMAGE_INSET_PT + workspace_page.rect.width * QUESTION_IMAGE_MAX_WIDTH_RATIO + 0.01
-        assert image_rect.y1 <= QUESTION_IMAGE_INSET_PT + workspace_page.rect.height * QUESTION_IMAGE_MAX_HEIGHT_RATIO + 0.01
+        assert image_rect.x1 <= workspace_page.rect.width - QUESTION_IMAGE_INSET_PT + 0.01
+        assert image_rect.y1 <= QUESTION_IMAGE_INSET_PT + workspace_page.rect.height * CONSISTENT_MAX_HEIGHT_RATIO + 0.01
+    # A large crop may use far more than the old 42% x 32% corner.
+    big_rect = _image_annotations(exported, exported[1])[0][0]
+    assert big_rect.width > exported[1].rect.width * QUESTION_IMAGE_MAX_WIDTH_RATIO
+    assert big_rect.height > exported[1].rect.height * QUESTION_IMAGE_MAX_HEIGHT_RATIO
     exported.close()
 
     too_large_scale = calculate_consistent_scale(1000, 900, 10, 200, 180)
@@ -233,15 +259,61 @@ def test_large_grouped_crop_does_not_shrink_small_sibling_unnecessarily(tmp_path
     exported = fitz.open(output)
     assert exported.page_count == 1
     workspace_page = exported[0]
-    image_rects = []
-    for image_xref, *_ in workspace_page.get_images(full=True):
-        image_rects.extend(workspace_page.get_image_rects(image_xref))
-    image_rects.sort(key=lambda rect: rect.y0)
+    image_rects = [rect for rect, _, _ in _image_annotations(exported, workspace_page)]
 
     assert len(image_rects) == 2
-    assert image_rects[0].height <= workspace_page.rect.height * QUESTION_IMAGE_MAX_HEIGHT_RATIO / 2 + 0.1
+    # The tall crop takes the space the short one does not need...
+    assert image_rects[0].height > workspace_page.rect.height * CONSISTENT_MAX_HEIGHT_RATIO / 2
+    # ...while the short sibling keeps its full requested scale.
     assert image_rects[1].height == pytest.approx(70 * MAX_CONSISTENT_SCALE)
     assert image_rects[0].y1 <= image_rects[1].y0
+    assert image_rects[1].y1 <= (
+        QUESTION_IMAGE_INSET_PT + workspace_page.rect.height * CONSISTENT_MAX_HEIGHT_RATIO + 0.01
+    )
+    exported.close()
+
+
+def test_exported_images_are_annotations_not_flattened_page_content(tmp_path):
+    source = tmp_path / "source.pdf"
+    output = tmp_path / "result.pdf"
+    _write_test_pdf(source)
+    regions = [QuestionRegion(page_index=0, rect=fitz.Rect(40, 50, 300, 220), label="1")]
+
+    export_question_regions(str(source), regions, str(output), page_size="A4")
+
+    exported = fitz.open(output)
+    page = exported[0]
+    assert page.get_images() == []
+    annots = list(page.annots())
+    assert len(annots) == 1
+    assert annots[0].type[1] == "Square"
+    assert len(_image_annotations(exported, page)) == 1
+    exported.close()
+
+
+def test_same_text_size_crops_get_the_same_scale_regardless_of_crop_size(tmp_path):
+    source = tmp_path / "mixed_sizes.pdf"
+    output = tmp_path / "mixed_sizes_workspace.pdf"
+    document = fitz.open()
+    page = document.new_page(width=800, height=1000)
+    page.insert_text((30, 50), "Small question", fontsize=10)
+    page.insert_text((30, 450), "Big question", fontsize=10)
+    document.save(source)
+    document.close()
+    regions = [
+        QuestionRegion(page_index=0, rect=fitz.Rect(20, 30, 220, 130)),
+        QuestionRegion(page_index=0, rect=fitz.Rect(20, 420, 320, 720)),
+    ]
+
+    export_question_regions(
+        str(source), regions, str(output), page_size="A4", scaling_mode=CONSISTENT_TEXT_SIZE
+    )
+
+    exported = fitz.open(output)
+    for page_index, region in enumerate(regions):
+        rect = _image_annotations(exported, exported[page_index])[0][0]
+        assert rect.width / region.rect.width == pytest.approx(MAX_CONSISTENT_SCALE, rel=1e-3)
+        assert rect.height / region.rect.height == pytest.approx(MAX_CONSISTENT_SCALE, rel=1e-3)
     exported.close()
 
 
@@ -275,7 +347,7 @@ def test_export_uses_automatically_generated_region_through_existing_path(tmp_pa
 
     exported = fitz.open(output)
     assert exported.page_count == 1
-    assert exported[0].get_images()
+    assert len(_image_annotations(exported, exported[0])) == 1
     exported.close()
 
 
@@ -332,17 +404,14 @@ def test_multiple_regions_from_different_pages_export_in_order_on_one_workspace_
     exported = fitz.open(output)
     assert exported.page_count == 2
     first_page = exported[0]
-    image_rects = []
-    for image_xref, *_ in first_page.get_images(full=True):
-        image_rects.extend(first_page.get_image_rects(image_xref))
-    image_rects.sort(key=lambda rect: rect.y0)
+    image_rects = [rect for rect, _, _ in _image_annotations(exported, first_page)]
     assert len(image_rects) == 3
     expected_ratios = [200 / 60, 100 / 100, 80 / 160]
     for rect, expected_ratio in zip(image_rects, expected_ratios):
         assert rect.width / rect.height == pytest.approx(expected_ratio, rel=1e-6)
         assert rect.x0 == pytest.approx(QUESTION_IMAGE_INSET_PT)
-        assert rect.x1 <= QUESTION_IMAGE_INSET_PT + first_page.rect.width * QUESTION_IMAGE_MAX_WIDTH_RATIO + 0.01
-        assert rect.y1 <= QUESTION_IMAGE_INSET_PT + first_page.rect.height * QUESTION_IMAGE_MAX_HEIGHT_RATIO + 0.01
+        assert rect.x1 <= first_page.rect.width - QUESTION_IMAGE_INSET_PT + 0.01
+        assert rect.y1 <= QUESTION_IMAGE_INSET_PT + first_page.rect.height * CONSISTENT_MAX_HEIGHT_RATIO + 0.01
     assert all(
         next_rect.y0 - previous_rect.y1 >= 11
         for previous_rect, next_rect in zip(image_rects, image_rects[1:])
@@ -356,9 +425,9 @@ def test_multiple_regions_from_different_pages_export_in_order_on_one_workspace_
         actual_color = pixmap.pixel(center_x, center_y)
         assert actual_color == expected_color
 
-    second_page_images = exported[1].get_images(full=True)
+    second_page_images = _image_annotations(exported, exported[1])
     assert len(second_page_images) == 1
-    second_page_rect = exported[1].get_image_rects(second_page_images[0][0])[0]
+    second_page_rect = second_page_images[0][0]
     second_pixmap = exported[1].get_pixmap()
     second_color = second_pixmap.pixel(
         round((second_page_rect.x0 + second_page_rect.x1) / 2),
@@ -376,10 +445,9 @@ def test_multiple_regions_from_different_pages_export_in_order_on_one_workspace_
     )
     fit_exported = fitz.open(fit_output)
     assert fit_exported.page_count == 2
-    fit_first_images = fit_exported[0].get_images(full=True)
+    fit_first_images = _image_annotations(fit_exported, fit_exported[0])
     assert len(fit_first_images) == 3
-    fit_first_rects = [fit_exported[0].get_image_rects(item[0])[0] for item in fit_first_images]
-    fit_first_rects.sort(key=lambda rect: rect.y0)
+    fit_first_rects = [rect for rect, _, _ in fit_first_images]
     assert all(
         rect.width / rect.height == pytest.approx(ratio, rel=1e-6)
         for rect, ratio in zip(fit_first_rects, expected_ratios)

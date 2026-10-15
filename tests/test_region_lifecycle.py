@@ -868,7 +868,7 @@ def test_run_ocr_button_creates_exportable_region_from_selected_page(tmp_path, m
     export_question_regions(str(source), generated, str(output))
     exported = fitz.open(output)
     assert exported.page_count == len(generated)
-    assert all(page.get_images() for page in exported)
+    assert all(list(page.annots()) and not page.get_images() for page in exported)
     exported.close()
 
     window.pdf_service.close()

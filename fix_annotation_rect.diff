@@ -1,0 +1,25 @@
+diff --git a/pdfcropper/exporter.py b/pdfcropper/exporter.py
+index 6e2fcdd..139bd87 100644
+--- a/pdfcropper/exporter.py
++++ b/pdfcropper/exporter.py
+@@ -291,11 +291,19 @@ def _add_image_annotation(document, page, rect, png_bytes):
+     )
+ 
+     annot_xref = page.add_rect_annot(rect).xref
++    # add_rect_annot pads /Rect for its default border (via /RD); we want the
++    # annotation to be exactly the image rectangle, matching the appearance BBox.
++    page_height = page.rect.height
++    document.xref_set_key(
++        annot_xref,
++        "Rect",
++        f"[{rect.x0:.4f} {page_height - rect.y1:.4f} {rect.x1:.4f} {page_height - rect.y0:.4f}]",
++    )
+     document.xref_set_key(annot_xref, "AP", f"<</N {form_xref} 0 R>>")
+     document.xref_set_key(annot_xref, "BS", "<</W 0>>")
+     document.xref_set_key(annot_xref, "F", "4")
+     document.xref_set_key(annot_xref, "NM", f"({uuid4().hex})")
+-    for key in ("C", "IC", "CA", "Border"):
++    for key in ("C", "IC", "CA", "Border", "RD"):
+         document.xref_set_key(annot_xref, key, "null")
+ 
+ 

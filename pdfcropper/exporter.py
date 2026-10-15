@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from io import BytesIO
 import math
+from statistics import median
+from uuid import uuid4
 
 try:
     import pymupdf as fitz
@@ -10,7 +12,6 @@ except ImportError:  # pragma: no cover
 from PyQt6.QtGui import QGuiApplication
 from reportlab.lib.colors import black
 from reportlab.lib.pagesizes import A4, letter
-from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 FALLBACK_PAGE_SIZE = A4
@@ -25,8 +26,15 @@ DEFAULT_EXPORT_SCALING_MODE = CONSISTENT_TEXT_SIZE
 MIN_CONSISTENT_SCALE = 0.5
 MAX_CONSISTENT_SCALE = 1.5
 TARGET_TEXT_SIZE_PT = 16.0
-FALLBACK_CROP_HEIGHT_PT = 180.0
+# Text size assumed for crops with no text layer (e.g. scanned pages) when no
+# other crop in the export has text to borrow a size from.
+DEFAULT_ASSUMED_TEXT_SIZE_PT = 11.0
 MULTI_REGION_GAP_PT = 12.0
+# In consistent-text-size mode a crop may use the full page width and this
+# fraction of the page height, so large crops keep their text size instead of
+# being squeezed into a small corner. Only fit-to-area mode uses the 0.42/0.32
+# ratios above.
+CONSISTENT_MAX_HEIGHT_RATIO = 0.85
 
 
 def _page_size_tuple(page_size: str):
@@ -154,8 +162,7 @@ def _render_region(pdf, region):
         alpha=False,
         colorspace=fitz.csRGB,
     )
-    image_reader = ImageReader(BytesIO(pix.tobytes("png")))
-    return clip, pix, image_reader
+    return clip, pix, pix.tobytes("png")
 
 
 def estimate_region_text_size(pdf, region) -> float | None:
@@ -196,26 +203,112 @@ def calculate_consistent_scale(
     max_width: float,
     max_height: float,
 ) -> float:
-    """Choose a bounded scale from text geometry, or crop height when text is absent."""
-    if text_size is not None and math.isfinite(text_size) and text_size > 0:
-        requested = TARGET_TEXT_SIZE_PT / text_size
-    else:
-        requested = FALLBACK_CROP_HEIGHT_PT / max(float(crop_height), 1.0)
-    requested = min(MAX_CONSISTENT_SCALE, max(MIN_CONSISTENT_SCALE, requested))
+    """Choose the scale that brings the crop's text to the target size, capped by the area."""
+    requested = requested_text_scale(text_size)
     area_limit = min(float(max_width) / crop_width, float(max_height) / crop_height)
     return min(requested, area_limit)
+
+
+def requested_text_scale(text_size: float | None) -> float:
+    """Bounded scale that would render text of ``text_size`` at the target size."""
+    if text_size is None or not math.isfinite(text_size) or text_size <= 0:
+        text_size = DEFAULT_ASSUMED_TEXT_SIZE_PT
+    requested = TARGET_TEXT_SIZE_PT / text_size
+    return min(MAX_CONSISTENT_SCALE, max(MIN_CONSISTENT_SCALE, requested))
+
+
+def _resolve_text_sizes(pdf, regions) -> dict[int, float | None]:
+    """Map id(region) to its text size; crops without text borrow the median of the others."""
+    sizes = {id(region): estimate_region_text_size(pdf, region) for region in regions}
+    known = [size for size in sizes.values() if size is not None]
+    reference = median(known) if known else None
+    return {key: (size if size is not None else reference) for key, size in sizes.items()}
+
+
+def _allocate_group_scales(crop_heights, wanted_scales, max_height):
+    """Fit stacked crops into ``max_height`` without shrinking crops that already fit.
+
+    Each crop keeps its wanted scale if it fits in an equal share of the height.
+    Height left over by the small crops goes to the larger ones, which are only
+    shrunk when they still do not fit.
+    """
+    scales = list(wanted_scales)
+    heights = [height * scale for height, scale in zip(crop_heights, scales)]
+    pending = set(range(len(scales)))
+    remaining = float(max_height)
+    while pending:
+        share = remaining / len(pending)
+        fitting = [index for index in pending if heights[index] <= share + 1e-9]
+        if not fitting:
+            for index in pending:
+                scales[index] = share / crop_heights[index]
+            break
+        for index in fitting:
+            remaining -= heights[index]
+            pending.discard(index)
+    return scales
 
 
 def _workspace_crop_area(page_width, page_height, margin):
     inset = max(0.0, float(margin))
     left = min(inset, page_width / 2)
     top = min(inset, page_height / 2)
-    max_width = min(page_width - 2 * left, page_width * QUESTION_IMAGE_MAX_WIDTH_RATIO)
-    max_height = min(page_height - top, page_height * QUESTION_IMAGE_MAX_HEIGHT_RATIO)
+    max_width = page_width - 2 * left
+    max_height = min(page_height - top, page_height * CONSISTENT_MAX_HEIGHT_RATIO)
     return left, top, max_width, max_height
 
 
+def _top_left_rect(x, y_bottom, width, height, page_height):
+    """Convert a bottom-left-origin placement to a top-left-origin fitz.Rect."""
+    return fitz.Rect(x, page_height - y_bottom - height, x + width, page_height - y_bottom)
+
+
+def _add_image_annotation(document, page, rect, png_bytes):
+    """Add the image as a movable/resizable annotation instead of flattening it into the page.
+
+    This mirrors what Charta/Okular write for an inserted image: a /Square
+    annotation (no border) whose normal appearance stream draws the image.
+    """
+    pixmap = fitz.Pixmap(png_bytes)
+    image_xref = document.get_new_xref()
+    document.update_object(
+        image_xref,
+        f"<</Type/XObject/Subtype/Image/Width {pixmap.width}/Height {pixmap.height}"
+        "/ColorSpace/DeviceRGB/BitsPerComponent 8>>",
+    )
+    document.update_stream(image_xref, pixmap.samples, new=True)
+
+    width, height = rect.width, rect.height
+    form_xref = document.get_new_xref()
+    document.update_object(
+        form_xref,
+        "<</Type/XObject/Subtype/Form/FormType 1"
+        f"/BBox[0 0 {width:.4f} {height:.4f}]/Matrix[1 0 0 1 0 0]"
+        f"/Resources<</XObject<</Im0 {image_xref} 0 R>>>>>>",
+    )
+    document.update_stream(
+        form_xref, f"q {width:.4f} 0 0 {height:.4f} 0 0 cm /Im0 Do Q".encode(), new=True
+    )
+
+    annot_xref = page.add_rect_annot(rect).xref
+    # add_rect_annot pads /Rect for its default border (via /RD); we want the
+    # annotation to be exactly the image rectangle, matching the appearance BBox.
+    page_height = page.rect.height
+    document.xref_set_key(
+        annot_xref,
+        "Rect",
+        f"[{rect.x0:.4f} {page_height - rect.y1:.4f} {rect.x1:.4f} {page_height - rect.y0:.4f}]",
+    )
+    document.xref_set_key(annot_xref, "AP", f"<</N {form_xref} 0 R>>")
+    document.xref_set_key(annot_xref, "BS", "<</W 0>>")
+    document.xref_set_key(annot_xref, "F", "4")
+    document.xref_set_key(annot_xref, "NM", f"({uuid4().hex})")
+    for key in ("C", "IC", "CA", "Border", "RD"):
+        document.xref_set_key(annot_xref, key, "null")
+
+
 def _draw_region_group_fit(canvas, pdf, page_width, page_height, parts, margin):
+    """Draw the black page and return the (rect, png) placements for its images."""
     rendered = [_render_region(pdf, region) for region in parts]
     inset = max(0.0, float(margin))
     top = min(inset, page_height / 2)
@@ -230,55 +323,42 @@ def _draw_region_group_fit(canvas, pdf, page_width, page_height, parts, margin):
 
     canvas.setFillColor(black)
     canvas.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+    placements = []
     cursor_top = page_height - top
-    for clip, _, image_reader in rendered:
+    for clip, _, png in rendered:
         width = clip.width * scale
         height = clip.height * scale
         cursor_top -= height
-        canvas.drawImage(
-            image_reader,
-            left,
-            cursor_top,
-            width=width,
-            height=height,
-            preserveAspectRatio=True,
-        )
+        placements.append((_top_left_rect(left, cursor_top, width, height, page_height), png))
         cursor_top -= gap
+    return placements
 
 
-def _draw_region_group_consistent(canvas, pdf, page_width, page_height, parts, margin):
+def _draw_region_group_consistent(canvas, pdf, page_width, page_height, parts, margin, text_sizes):
+    """Draw the black page and return the (rect, png) placements for its images."""
     rendered = [_render_region(pdf, region) for region in parts]
     left, top, max_width, max_height = _workspace_crop_area(page_width, page_height, margin)
     gap = min(MULTI_REGION_GAP_PT, max_height / max(2 * len(rendered), 1))
     available_height = max_height - gap * (len(rendered) - 1)
-    per_region_height = available_height / len(rendered)
-    scales = [
-        calculate_consistent_scale(
-            clip.width,
-            clip.height,
-            estimate_region_text_size(pdf, region),
-            max_width,
-            per_region_height,
-        )
+    wanted = [
+        min(requested_text_scale(text_sizes[id(region)]), max_width / clip.width)
         for region, (clip, _, _) in zip(parts, rendered)
     ]
-    heights = [clip.height * scale for (clip, _, _), scale in zip(rendered, scales)]
+    scales = _allocate_group_scales(
+        [clip.height for clip, _, _ in rendered], wanted, available_height
+    )
 
     canvas.setFillColor(black)
     canvas.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+    placements = []
     cursor_top = page_height - top
-    for (clip, _, image_reader), scale, height in zip(rendered, scales, heights):
+    for (clip, _, png), scale in zip(rendered, scales):
         width = clip.width * scale
+        height = clip.height * scale
         cursor_top -= height
-        canvas.drawImage(
-            image_reader,
-            left,
-            cursor_top,
-            width=width,
-            height=height,
-            preserveAspectRatio=True,
-        )
+        placements.append((_top_left_rect(left, cursor_top, width, height, page_height), png))
         cursor_top -= gap
+    return placements
 
 
 def export_question_regions(
@@ -289,7 +369,11 @@ def export_question_regions(
     margin: float = QUESTION_IMAGE_INSET_PT,
     scaling_mode: str = DEFAULT_EXPORT_SCALING_MODE,
 ):
-    """Export each question as one black workspace page with its crops stacked at the upper-left."""
+    """Export each question as one black workspace page with its crops stacked at the upper-left.
+
+    The crops are not flattened into the page: each one is a separate image
+    annotation, so it can be moved and resized in Charta/Okular.
+    """
     if not regions:
         raise ValueError("No question rectangles selected for export.")
     if scaling_mode not in {FIT_TO_AVAILABLE_AREA, CONSISTENT_TEXT_SIZE}:
@@ -297,19 +381,26 @@ def export_question_regions(
 
     pdf = fitz.open(document_path)
     page_width, page_height = resolve_workspace_page_size(page_size)
-    output = canvas.Canvas(str(output_path), pagesize=(page_width, page_height))
+    background = BytesIO()
+    output = canvas.Canvas(background, pagesize=(page_width, page_height))
+    text_sizes = (
+        _resolve_text_sizes(pdf, regions) if scaling_mode == CONSISTENT_TEXT_SIZE else {}
+    )
 
+    page_placements = []
     for parts in _question_region_groups(regions):
         if len(parts) > 1:
-            draw_group = (
-                _draw_region_group_fit
-                if scaling_mode == FIT_TO_AVAILABLE_AREA
-                else _draw_region_group_consistent
-            )
-            draw_group(output, pdf, page_width, page_height, parts, margin)
+            if scaling_mode == FIT_TO_AVAILABLE_AREA:
+                placements = _draw_region_group_fit(
+                    output, pdf, page_width, page_height, parts, margin
+                )
+            else:
+                placements = _draw_region_group_consistent(
+                    output, pdf, page_width, page_height, parts, margin, text_sizes
+                )
         else:
             region = parts[0]
-            clip, pix, image_reader = _render_region(pdf, region)
+            clip, pix, png = _render_region(pdf, region)
             if scaling_mode == FIT_TO_AVAILABLE_AREA:
                 x, y, image_width, image_height = resolve_question_image_placement(
                     page_width, page_height, pix.width, pix.height, margin
@@ -319,7 +410,7 @@ def export_question_regions(
                 scale = calculate_consistent_scale(
                     clip.width,
                     clip.height,
-                    estimate_region_text_size(pdf, region),
+                    text_sizes[id(region)],
                     max_width,
                     max_height,
                 )
@@ -329,16 +420,17 @@ def export_question_regions(
                 y = page_height - top - image_height
             output.setFillColor(black)
             output.rect(0, 0, page_width, page_height, fill=1, stroke=0)
-            output.drawImage(
-                image_reader,
-                x,
-                y,
-                width=image_width,
-                height=image_height,
-                preserveAspectRatio=True,
-            )
+            placements = [(_top_left_rect(x, y, image_width, image_height, page_height), png)]
+        page_placements.append(placements)
         output.showPage()
 
     output.save()
     pdf.close()
+
+    workspace = fitz.open("pdf", background.getvalue())
+    for page, placements in zip(workspace, page_placements):
+        for rect, png in placements:
+            _add_image_annotation(workspace, page, rect, png)
+    workspace.save(str(output_path), garbage=3, deflate=True)
+    workspace.close()
     return output_path
