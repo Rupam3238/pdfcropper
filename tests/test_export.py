@@ -48,7 +48,7 @@ def _image_annotations(document, page):
     """Return (rect, pixel_width, pixel_height) for each image annotation on a page."""
     found = []
     for annot in page.annots() or []:
-        assert annot.type[1] == "Square"
+        assert annot.type[1] == "Stamp"
         kind, ap_ref = document.xref_get_key(annot.xref, "AP/N")
         assert kind == "xref"
         ap_xref = int(ap_ref.split()[0])
@@ -286,7 +286,7 @@ def test_exported_images_are_annotations_not_flattened_page_content(tmp_path):
     assert page.get_images() == []
     annots = list(page.annots())
     assert len(annots) == 1
-    assert annots[0].type[1] == "Square"
+    assert annots[0].type[1] == "Stamp"
     assert len(_image_annotations(exported, page)) == 1
     exported.close()
 
