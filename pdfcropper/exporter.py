@@ -266,8 +266,8 @@ def _top_left_rect(x, y_bottom, width, height, page_height):
 def _add_image_annotation(document, page, rect, png_bytes):
     """Add the image as a movable/resizable annotation instead of flattening it into the page.
 
-    This mirrors what Charta/Okular write for an inserted image: a /Square
-    annotation (no border) whose normal appearance stream draws the image.
+    This mirrors what Charta/Okular write for an inserted image: a /Stamp
+    annotation whose normal appearance stream draws the image.
     """
     pixmap = fitz.Pixmap(png_bytes)
     image_xref = document.get_new_xref()
@@ -290,9 +290,18 @@ def _add_image_annotation(document, page, rect, png_bytes):
         form_xref, f"q {width:.4f} 0 0 {height:.4f} 0 0 cm /Im0 Do Q".encode(), new=True
     )
 
-    annot_xref = page.add_rect_annot(rect).xref
-    # add_rect_annot pads /Rect for its default border (via /RD); we want the
-    # annotation to be exactly the image rectangle, matching the appearance BBox.
+    # Create a text annotation as base for our custom stamp
+    # We'll change its subtype to /Stamp and set up the appearance
+    text_annot = page.add_text_annot(rect.top_left, "")
+    annot_xref = text_annot.xref
+
+    # Change subtype from /Text to /Stamp to make it a stamp annotation
+    document.xref_set_key(annot_xref, "Subtype", "/Stamp")
+
+    # Set the name to "Draft" to match Charta's clipboard image annotations
+    text_annot.set_name("Draft")
+
+    # Set up the appearance stream and rectangle (matching the image bounds)
     page_height = page.rect.height
     document.xref_set_key(
         annot_xref,
@@ -302,7 +311,10 @@ def _add_image_annotation(document, page, rect, png_bytes):
     document.xref_set_key(annot_xref, "AP", f"<</N {form_xref} 0 R>>")
     document.xref_set_key(annot_xref, "BS", "<</W 0>>")
     document.xref_set_key(annot_xref, "F", "4")
-    document.xref_set_key(annot_xref, "NM", f"({uuid4().hex})")
+    # Set NM to create the proper ID field that Charta recognizes
+    # The ID field in the annotation will be the NM value without parentheses
+    chama_id = f"charta-clipboard-image-{uuid4().hex}"
+    document.xref_set_key(annot_xref, "NM", f"({chama_id})")
     for key in ("C", "IC", "CA", "Border", "RD"):
         document.xref_set_key(annot_xref, key, "null")
 
